@@ -19,6 +19,8 @@ PUSHER="$REPO/CA_Pusher.sh"
 
 CACHE="$(mktemp -d)"
 WORK=""
+SERVER_PID=""
+SERVER_PORT=""
 OUT=""
 STDOUT=""
 RC=0
@@ -29,6 +31,7 @@ SKIPPED=0
 FAILED=()
 
 cleanup() {
+  [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null
   [[ -n "$WORK" ]] && rm -rf "$WORK"
   rm -rf "$CACHE"
 }
@@ -117,6 +120,37 @@ faker_outdir() {
       || { fail "could not build the CA_Faker fixture"; return 1; }
   fi
   cp -a "$CACHE/base" "$1"
+}
+
+# Serve a CA_Faker out-dir's cert on a loopback port (sets SERVER_PORT).
+start_tls_server() {
+  local od="$1"
+  SERVER_PORT=$((20000 + RANDOM % 30000))
+  openssl s_server -accept "$SERVER_PORT" -cert "$od/issued/server.crt.pem" \
+    -key "$od/private.key.insecure" -cert_chain "$od/ca/intermediate.crt.pem" \
+    -quiet </dev/null >/dev/null 2>&1 &
+  SERVER_PID=$!
+  for _ in $(seq 50); do
+    openssl s_client -connect "127.0.0.1:$SERVER_PORT" </dev/null >/dev/null 2>&1 && return 0
+    sleep 0.1
+  done
+  fail "s_server did not start on port $SERVER_PORT"
+  return 1
+}
+
+stop_tls_server() {
+  [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null
+  wait "$SERVER_PID" 2>/dev/null || true
+  SERVER_PID=""
+}
+
+# Run the root script's tls_check locally, trusting only the given CA file.
+run_tls_check() {
+  local ca="$1" ep="$2"
+  sed -n '/^tls_check() {/,/^}/p' "$PUSHER" > tls_check.sh
+  mkdir -p empty_ca_dir
+  run_cmd env SSL_CERT_FILE="$ca" SSL_CERT_DIR="$PWD/empty_ca_dir" \
+    bash -c 'source ./tls_check.sh; tls_check "$1"' _ "$ep"
 }
 
 # A throwaway self-signed CA dir laid out like a CA_Faker out-dir.
@@ -444,6 +478,203 @@ test_faker_self_check_catches_leaf_without_aki() {
   assert_rc 1
   assert_contains "Self-check failed: server cert has no Authority Key Identifier"
   assert_no_file od/certbundle.pem
+}
+
+check_names() {
+  run_cmd "$FAKER" --check-names "$@"
+}
+
+test_names_accepts_good_names_and_prints_final_san_list() {
+  check_names --cn qumulo
+  assert_rc 0
+  assert_eq "$STDOUT" "dns:qumulo" "--cn qumulo"
+
+  check_names --cn stratusdatacore.qumulotest.local
+  assert_rc 0
+  assert_eq "$STDOUT" $'dns:stratusdatacore.qumulotest.local\ndns:stratusdatacore' "default SAN adds short name"
+
+  check_names --cn 10.1.1.10
+  assert_rc 0
+  assert_eq "$STDOUT" "ip:10.1.1.10" "IPv4 CN"
+
+  check_names --cn 2001:db8::10
+  assert_rc 0
+  assert_eq "$STDOUT" "ip:2001:db8::10" "IPv6 CN"
+
+  check_names --cn '*.qumulotest.local'
+  assert_rc 0
+  assert_eq "$STDOUT" 'dns:*.qumulotest.local' "wildcard CN"
+
+  check_names --cn 10.lab.test
+  assert_rc 0
+  assert_eq "$STDOUT" "dns:10.lab.test" "numeric short name dropped"
+  assert_contains "INFO: Not adding short name 10 — browsers would treat it as an IP address."
+
+  check_names --cn node1.lab.test --san ip:10.0.0.1
+  assert_rc 0
+  assert_eq "$STDOUT" $'dns:node1.lab.test\nip:10.0.0.1' "CN prepended"
+  assert_contains "INFO: Added dns:node1.lab.test to the SAN list — browsers ignore the CN and only check SANs."
+
+  check_names --cn node1.lab.test --san DNS:Node1.Lab.Test
+  assert_rc 0
+  assert_eq "$STDOUT" "dns:Node1.Lab.Test" "CN match is case-insensitive"
+
+  check_names --cn my_host.lab.test
+  assert_rc 0
+
+  check_names --cn x.lab.test --san "ip:::1,ip:::ffff:10.0.0.1,dns:x.lab.test"
+  assert_rc 0
+  assert_eq "$STDOUT" $'ip:::1\nip:::ffff:10.0.0.1\ndns:x.lab.test' "IPv6 forms"
+
+  check_names --cn "$(printf 'a%.0s' $(seq 60)).lab"
+  assert_rc 0
+}
+
+test_names_rejects_bad_names_before_writing_anything() {
+  local -a bad=(
+    "--cn x.lab.test --san ip:999.1.1.1"
+    "--cn x.lab.test --san ip:010.0.0.1"
+    "--cn x.lab.test --san dns:10.0.0.1"
+    "--cn x.lab.test --san dns:1.2.3"
+    "--cn x.lab.test --san dns:foo*.lab.test"
+    "--cn x.lab.test --san dns:*.test"
+    "--cn x.lab.test --san dns:a.*.test"
+    "--cn 010.0.0.1"
+    "--cn host:443"
+    "--cn x.lab.test --san dns:lab.test."
+    "--cn x.lab.test --san dns:a..test"
+    "--cn x.lab.test --san dns:-x.lab.test"
+    "--cn x.lab.test --san dns:"
+    "--cn x.lab.test --san ip:1:2"
+    "--cn cafe:443"
+    "--cn x.lab.test --san ip:[::1]"
+    "--cn x.lab.test --san dns:foo.0x1f"
+    "--cn [::1]"
+  )
+  local args
+  for args in "${bad[@]}"; do
+    rm -rf od
+    mkdir od
+    # shellcheck disable=SC2086
+    run_cmd "$FAKER" $args --out-dir ./od
+    [[ "$RC" -eq 1 ]] || fail "expected exit 1 for: $args (got $RC)"
+    [[ "$OUT" == *"ERROR:"* ]] || fail "expected ERROR for: $args"
+    [[ -z "$(ls -A od)" ]] || fail "files were written for: $args"
+  done
+}
+
+test_names_trims_spaces_around_san_entries() {
+  check_names --cn x.lab.test --san "dns:x.lab.test, ip:10.0.0.1 , dns:y.lab.test"
+  assert_rc 0
+  assert_eq "$STDOUT" $'dns:x.lab.test\nip:10.0.0.1\ndns:y.lab.test' "SAN list with spaces"
+}
+
+test_names_rejects_cn_longer_than_64() {
+  check_names --cn "$(printf 'a%.0s' $(seq 62)).lab"
+  assert_rc 1
+  assert_contains "ERROR: --cn must be 64 characters or fewer (put long names in --san)"
+}
+
+test_names_specific_messages() {
+  check_names --cn x.lab.test --san dns:10.0.0.1
+  assert_contains "ERROR: dns:10.0.0.1 is an IP address; use ip:10.0.0.1"
+  check_names --cn x.lab.test --san dns:1.2.3
+  assert_contains "ERROR: 1.2.3 is not a valid DNS name (letters, digits and '-' only, dot-separated; use xn-- punycode for international names; all-number names are read as IP addresses by browsers)"
+}
+
+test_faker_server_days_over_825_warns() {
+  check_names --cn x.lab.test --server-days 900
+  assert_rc 0
+  assert_contains "WARNING: Apple devices reject TLS certs valid for more than 825 days"
+}
+
+test_faker_issues_and_self_checks_ip_wildcard_and_ipv6_names() {
+  run_cmd "$FAKER" --cn stratusdatacore.qumulotest.local \
+    --san "dns:*.qumulotest.local,ip:10.1.1.10,ip:2001:db8::10" --out-dir ./od
+  assert_rc 0
+  assert_contains "INFO: Added dns:stratusdatacore.qumulotest.local to the SAN list"
+  local sans
+  sans="$(leaf_sans od/issued/server.crt.pem)"
+  assert_eq "$sans" "DNS:stratusdatacore.qumulotest.local, DNS:*.qumulotest.local, IP Address:10.1.1.10, IP Address:2001:DB8:0:0:0:0:0:10" "leaf SANs"
+}
+
+test_versions_report_2_0_0() {
+  run_cmd "$FAKER" --version
+  assert_rc 0
+  assert_eq "$STDOUT" "CA_Faker.sh 2.0.0" "CA_Faker --version"
+  run_cmd "$PUSHER" --version
+  assert_rc 0
+  assert_eq "$STDOUT" "CA_Pusher.sh 2.0.0" "CA_Pusher --version"
+}
+
+# CA_Pusher carries its own copy of the name rules; they must not drift.
+test_name_rule_copies_are_identical() {
+  local f
+  for f in is_ipv4 ipv6_groups is_ipv6 is_ip_literal is_dns_name; do
+    assert_eq "$(sed -n "/^$f() {/,/^}/p" "$PUSHER")" "$(sed -n "/^$f() {/,/^}/p" "$FAKER")" "$f in CA_Pusher.sh vs CA_Faker.sh"
+    [[ -n "$(sed -n "/^$f() {/,/^}/p" "$FAKER")" ]] || fail "$f not found in CA_Faker.sh"
+  done
+}
+
+test_pusher_rejects_bad_verify_tls() {
+  make_plain_ca od
+  : > clients.txt
+  local ep
+  for ep in ":443" "::1:443" "host" "host:0" "host:65536" "host:08" "a'b:443" 'x&y:443' \
+      '*.lab.test:443' '[::1]' '[zz::1]:443' '10.1:443' 'node1.lab.test.:443'; do
+    run_cmd "$PUSHER" --clients clients.txt --ca od --verify-tls "$ep"
+    [[ "$RC" -eq 1 ]] || fail "expected exit 1 for --verify-tls '$ep'"
+    [[ "$OUT" == *"ERROR: --verify-tls must be host:port"* ]] || fail "expected --verify-tls error for '$ep'"
+  done
+}
+
+# Accepted values get past argument checks to the (empty) clients file.
+test_pusher_accepts_good_verify_tls() {
+  make_plain_ca od
+  : > clients.txt
+  local ep
+  for ep in "stratusdatacore.qumulotest.local:443" "[::1]:443" "[2001:db8::10]:8000" "10.1.1.10:443" "qumulo:443"; do
+    run_cmd "$PUSHER" --clients clients.txt --ca od --verify-tls "$ep"
+    [[ "$OUT" == *"ERROR: No hosts found"* ]] || fail "--verify-tls '$ep' was not accepted"
+  done
+}
+
+# The root script's TLS check must fail on an untrusted chain and on a name
+# or IP the cert does not list (it used to check neither reliably).
+test_pusher_tls_check_validates_chain_and_name() {
+  faker_outdir od || return 1
+  run_cmd "$FAKER" --cn localhost --san "dns:localhost,ip:127.0.0.1" --out-dir ./od --force-reissue
+  assert_rc 0
+  cp -a od od_dns_only
+  run_cmd "$FAKER" --cn localhost --san "dns:localhost" --out-dir ./od_dns_only --force-reissue
+  assert_rc 0
+  make_plain_ca other
+
+  start_tls_server od || return 1
+  run_tls_check od/ca/ca.crt.pem "127.0.0.1:$SERVER_PORT"
+  assert_rc 0
+  run_tls_check other/ca/ca.crt.pem "127.0.0.1:$SERVER_PORT"
+  assert_rc 1
+  assert_contains "unable to get local issuer certificate"
+  stop_tls_server
+
+  start_tls_server od_dns_only || return 1
+  run_tls_check od_dns_only/ca/ca.crt.pem "127.0.0.1:$SERVER_PORT"
+  assert_rc 1
+  assert_contains "IP address mismatch"
+  stop_tls_server
+
+  # The name check: a cert that does not list "localhost" must be rejected
+  # when connecting by that name, even though the chain is trusted.
+  cp -a od od_other_name
+  run_cmd "$FAKER" --cn other.lab.test --san "dns:other.lab.test,ip:127.0.0.1" --out-dir ./od_other_name --force-reissue
+  assert_rc 0
+  start_tls_server od_other_name || return 1
+  run_tls_check od_other_name/ca/ca.crt.pem "localhost:$SERVER_PORT"
+  assert_rc 1
+  # OpenSSL 1.1.1 prints "Hostname mismatch", 3.x "hostname mismatch".
+  [[ "${OUT,,}" == *"hostname mismatch"* ]] || { fail "output does not contain: hostname mismatch"; show_out; }
+  stop_tls_server
 }
 
 run_test() {

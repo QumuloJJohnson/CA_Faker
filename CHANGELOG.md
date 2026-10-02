@@ -2,6 +2,13 @@
 
 ## 2.0.0 (unreleased)
 
+### All scripts
+
+- Each script checks its platform first: bash 4 or newer and OpenSSL (not
+  LibreSSL). Stock macOS (bash 3.2, LibreSSL) gets an `ERROR:` with the
+  Homebrew fix instead of a confusing failure later.
+- New `--version` (prints `<script> 2.0.0`).
+
 ### CA_Pusher.sh
 
 - A host is counted OK only when every step on it succeeded. Before, a failed
@@ -33,6 +40,10 @@
   `WARNING: replacing a different lab's root on <host>`.
 - The remote root script detaches its stdin first, so the sudo password line
   can never be read by a later command.
+- `--verify-tls` checks the hostname (or IP) as well as the chain, on the
+  host and in the container (`-verify_hostname` / `-verify_ip`; SNI is sent
+  for names). The value must be `host:port`, IPv6 in brackets
+  (`[2001:db8::10]:443`); anything else is an `ERROR:` before any prompt.
 
 ### CA_Faker.sh
 
@@ -63,3 +74,16 @@
   refused: `ERROR: Existing Root CA at ... is missing keyUsage`.
 - `READY.` lists what was created or reused, read from the certs (CN,
   expiry, root SHA-256 and SHA-1), the names covered, and the next commands.
+- Names are validated before anything is generated (a bad name leaves no
+  half-built CA): `ip:` values must be IP addresses, `dns:` values must not
+  be; labels are letters, digits, `-` and `_`; no empty labels or trailing
+  dot; the last label may not be all digits or `0x` hex; `*` only as the
+  whole first label of a name with at least two more labels; `--cn` at most
+  64 characters.
+- Default SAN when `--san` is omitted: `ip:<cn>` for an IP CN,
+  `dns:<cn>,dns:<first label>` for a dotted name (the short name is skipped
+  if browsers would read it as an IP), `dns:<cn>` otherwise. The CN is added
+  to `--san` when missing, with an `INFO:` line.
+- `--server-days` above 825 prints a WARNING (Apple's limit).
+- New `--check-names`: validates `--cn`/`--san`, prints the final SAN list
+  one entry per line, writes nothing.

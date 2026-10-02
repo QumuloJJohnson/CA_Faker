@@ -3,6 +3,7 @@
 #
 # Script to prepare TLS materials for Qumulo Cluster A
 # up to (but NOT including) running `qq ssl_modify_certificate`.
+# Runs on Linux, WSL, or macOS with Homebrew bash 4+ and OpenSSL 3.
 #
 # REQUIRED: --cn <fqdn>
 #
@@ -27,9 +28,26 @@
 
 set -euo pipefail
 
+# Stock macOS bash 3.2 cannot parse the rest of this script, so this check
+# runs before any function is defined.
+if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "ERROR: macOS needs Homebrew bash and OpenSSL: brew install bash openssl@3, then run with PATH=\"\$(brew --prefix openssl@3)/bin:\$PATH\" bash $0 ..." >&2
+  else
+    echo "ERROR: bash 4 or newer is required; found bash $BASH_VERSION" >&2
+  fi
+  exit 1
+fi
+
+VERSION="2.0.0"
+
 # ---- defaults ----
 CN=""  # REQUIRED runtime flag
-SAN_LIST=""  # defaults to dns:$CN if not provided
+SAN_LIST=""  # defaults per prepare_names if not provided
+SAN_GIVEN=0
+SAN_OPENSSL=""
+NAME_NOTES=()
+CHECK_NAMES=0
 OUT_DIR="./qumulo-tls"
 CA_NAME="Company Lab Root CA"
 INT_NAME="Company Lab Intermediate CA"
@@ -50,13 +68,20 @@ Required:
   --cn <fqdn>                 Server certificate Common Name (e.g. datacore.company.com)
 
 Optional:
-  --san <list>                SAN list. If omitted, defaults to "dns:<cn>"
-                              Format: dns:name,ip:addr
+  --san <list>                SAN list. If omitted, defaults to "ip:<cn>" for an IP,
+                              "dns:<cn>,dns:<first label>" for a dotted name
+                              (e.g. dns:node1.lab.test,dns:node1), else "dns:<cn>".
+                              The CN is always added if missing.
+                              Format: dns:name,ip:addr (IPs must use ip:)
                               Example: --san "dns:datacore.company.com,dns:*.datacore.company.com,ip:10.10.10.10"
   --out-dir <path>            Output directory (default: $OUT_DIR)
-  --server-days <days>        Server cert validity days (default: $SERVER_DAYS)
+  --server-days <days>        Server cert validity days (default: $SERVER_DAYS;
+                              Apple devices reject more than 825)
   --ca-days <days>            CA cert validity days (default: $CA_DAYS)
   --force-reissue             Regenerate server key/cert even if present
+  --check-names               Validate --cn/--san, print the final SAN list
+                              (one entry per line) and exit; writes nothing
+  --version                   Show version
   --help                      Show help
 
 Outputs (in --out-dir):
@@ -75,8 +100,24 @@ EOF
 err() { echo "ERROR: $*" >&2; }
 info() { echo "INFO: $*" >&2; }
 
+warn() { echo "WARNING: $*" >&2; }
+
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || { err "Missing required command: $1"; exit 1; }
+}
+
+# Stock macOS ships LibreSSL, which lacks -verify_hostname and -verify_ip;
+# fail with the fix instead of a confusing error later.
+preflight() {
+  need_cmd openssl
+  if [[ "$(openssl version)" != OpenSSL* ]]; then
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      err "macOS needs Homebrew bash and OpenSSL: brew install bash openssl@3, then run with PATH=\"\$(brew --prefix openssl@3)/bin:\$PATH\" bash $0 ..."
+    else
+      err "OpenSSL (not LibreSSL) is required; found $(openssl version)"
+    fi
+    exit 1
+  fi
 }
 
 parse_args() {
@@ -85,7 +126,9 @@ parse_args() {
       --cn)
         CN="${2:-}"; shift 2 ;;
       --san)
-        SAN_LIST="${2:-}"; shift 2 ;;
+        SAN_LIST="${2:-}"
+        [[ -n "$SAN_LIST" ]] && SAN_GIVEN=1
+        shift 2 ;;
       --out-dir)
         OUT_DIR="${2:-}"; shift 2 ;;
       --server-days)
@@ -94,6 +137,10 @@ parse_args() {
         CA_DAYS="${2:-}"; shift 2 ;;
       --force-reissue)
         FORCE_REISSUE=1; shift 1 ;;
+      --check-names)
+        CHECK_NAMES=1; shift 1 ;;
+      --version)
+        echo "$(basename "$0") $VERSION"; exit 0 ;;
       --help|-h)
         usage; exit 0 ;;
       *)
@@ -109,17 +156,92 @@ parse_args() {
     exit 1
   fi
 
-  # If SAN not provided, default to dns:<CN>
-  if [[ -z "$SAN_LIST" ]]; then
-    SAN_LIST="dns:${CN}"
-  fi
-
   if ! [[ "$SERVER_DAYS" =~ ^[0-9]+$ ]] || [[ "$SERVER_DAYS" -lt 1 ]]; then
     err "--server-days must be a positive integer"; exit 1
   fi
   if ! [[ "$CA_DAYS" =~ ^[0-9]+$ ]] || [[ "$CA_DAYS" -lt 1 ]]; then
     err "--ca-days must be a positive integer"; exit 1
   fi
+  if [[ "$SERVER_DAYS" -gt 825 ]]; then
+    warn "Apple devices reject TLS certs valid for more than 825 days"
+  fi
+}
+
+is_ipv4() {
+  local o
+  [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do
+    [[ "$o" =~ ^(0|[1-9][0-9]*)$ ]] && (( 10#$o <= 255 )) || return 1
+  done
+}
+
+# Prints how many 16-bit groups one side of an IPv6 address holds (a
+# trailing dotted quad counts as 2); fails if a group is malformed.
+ipv6_groups() {
+  local s="$1" n=0 g last
+  local -a gs
+  [[ -z "$s" ]] && { echo 0; return 0; }
+  last="${s##*:}"
+  if [[ "$last" == *.* ]]; then
+    is_ipv4 "$last" || return 1
+    n=2
+    [[ "$s" == "$last" ]] && { echo 2; return 0; }
+    s="${s%:*}"
+  fi
+  [[ "$s" == *: || "$s" == :* ]] && return 1
+  IFS=: read -r -a gs <<< "$s"
+  for g in "${gs[@]}"; do
+    [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    n=$((n+1))
+  done
+  echo "$n"
+}
+
+is_ipv6() {
+  local a="$1" l r nl nr
+  [[ "$a" == *::*::* ]] && return 1
+  if [[ "$a" == *::* ]]; then
+    l="${a%%::*}"; r="${a#*::}"
+    [[ "$l" == *.* ]] && return 1
+    nl="$(ipv6_groups "$l")" || return 1
+    nr="$(ipv6_groups "$r")" || return 1
+    (( nl + nr <= 7 ))
+  else
+    nl="$(ipv6_groups "$a")" || return 1
+    (( nl == 8 ))
+  fi
+}
+
+is_ip_literal() {
+  is_ipv4 "$1" || is_ipv6 "$1"
+}
+
+# Browsers parse an all-digit or 0x-hex last label as a number (an IPv4
+# address), and only accept '*' as the whole leftmost label.
+is_dns_name() {
+  local n="$1" label last i
+  local -a labels
+  [[ ${#n} -ge 1 && ${#n} -le 253 ]] || return 1
+  [[ "$n" == .* || "$n" == *. || "$n" == *..* ]] && return 1
+  IFS=. read -r -a labels <<< "$n"
+  for i in "${!labels[@]}"; do
+    label="${labels[$i]}"
+    if [[ "$i" -eq 0 && "$label" == "*" ]]; then
+      [[ ${#labels[@]} -ge 3 ]] || return 1
+      continue
+    fi
+    [[ "$label" =~ ^[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$ ]] || return 1
+  done
+  last="${labels[${#labels[@]}-1]}"
+  [[ "$last" =~ ^[0-9]+$ ]] && return 1
+  [[ "$last" =~ ^0[xX][0-9A-Fa-f]*$ ]] && return 1
+  return 0
+}
+
+check_dns_name() {
+  is_dns_name "$1" && return 0
+  err "$1 is not a valid DNS name (letters, digits and '-' only, dot-separated; use xn-- punycode for international names; all-number names are read as IP addresses by browsers)"
+  exit 1
 }
 
 # Convert SAN_LIST like "dns:a,ip:1.2.3.4,dns:*.x" into:
@@ -137,8 +259,16 @@ build_san_openssl() {
       err "Bad SAN entry '$p' (expected type:value like dns:example.com)"; exit 1
     fi
     case "${typ,,}" in
-      dns) out+="${out:+,}DNS:${val}" ;;
-      ip)  out+="${out:+,}IP:${val}" ;;
+      dns)
+        # Browsers match IPs only against IP SANs.
+        if is_ip_literal "$val"; then
+          err "dns:$val is an IP address; use ip:$val"; exit 1
+        fi
+        check_dns_name "$val"
+        out+="${out:+,}DNS:${val}" ;;
+      ip)
+        is_ip_literal "$val" || { err "ip:$val is not a valid IP address"; exit 1; }
+        out+="${out:+,}IP:${val}" ;;
       *) err "Unsupported SAN type '$typ' in '$p' (use dns: or ip:)"; exit 1 ;;
     esac
   done
@@ -147,6 +277,63 @@ build_san_openssl() {
     err "SAN list resolved to empty; check --san"; exit 1
   fi
   echo "$out"
+}
+
+# Prints SAN_OPENSSL as dns:/ip: entries, one per line.
+san_entries() {
+  local part
+  IFS=',' read -r -a parts <<< "$SAN_OPENSSL"
+  for part in "${parts[@]}"; do
+    case "$part" in
+      DNS:*) echo "dns:${part#DNS:}" ;;
+      IP:*) echo "ip:${part#IP:}" ;;
+    esac
+  done
+}
+
+# Builds the final SAN list before anything is generated, so a bad name
+# never leaves a half-built CA behind.
+prepare_names() {
+  local cn_entry short
+  if [[ ${#CN} -gt 64 ]]; then
+    err "--cn must be 64 characters or fewer (put long names in --san)"; exit 1
+  fi
+  if is_ip_literal "$CN"; then
+    cn_entry="ip:$CN"
+  else
+    check_dns_name "$CN"
+    cn_entry="dns:$CN"
+  fi
+
+  if [[ "$SAN_GIVEN" -eq 0 ]]; then
+    if [[ "$cn_entry" == ip:* || "$CN" == '*.'* || "$CN" != *.* ]]; then
+      SAN_LIST="$cn_entry"
+    else
+      short="${CN%%.*}"
+      if is_dns_name "$short"; then
+        SAN_LIST="dns:$CN,dns:$short"
+      else
+        SAN_LIST="dns:$CN"
+        NAME_NOTES+=("Not adding short name $short — browsers would treat it as an IP address.")
+      fi
+    fi
+  fi
+
+  SAN_OPENSSL="$(build_san_openssl "$SAN_LIST")"
+
+  # Browsers ignore the CN, so it must also be a SAN entry.
+  local entry found=0
+  while IFS= read -r entry; do
+    [[ "${entry,,}" == "${cn_entry,,}" ]] && found=1
+  done < <(san_entries)
+  if [[ "$found" -eq 0 ]]; then
+    if [[ "$cn_entry" == ip:* ]]; then
+      SAN_OPENSSL="IP:${CN},${SAN_OPENSSL}"
+    else
+      SAN_OPENSSL="DNS:${CN},${SAN_OPENSSL}"
+    fi
+    NAME_NOTES+=("Added $cn_entry to the SAN list — browsers ignore the CN and only check SANs.")
+  fi
 }
 
 write_ca_extfile() {
@@ -337,10 +524,20 @@ EOF
 }
 
 main() {
-  need_cmd openssl
+  preflight
   need_cmd sed
 
   parse_args "$@"
+  prepare_names
+
+  if [[ "$CHECK_NAMES" -eq 1 ]]; then
+    local note
+    for note in ${NAME_NOTES[@]+"${NAME_NOTES[@]}"}; do
+      info "$note"
+    done
+    san_entries
+    exit 0
+  fi
 
   umask 077
 
@@ -374,7 +571,7 @@ main() {
 
   info "Output directory: $OUT_DIR"
   info "Server CN (requested): $CN"
-  info "SAN list (requested): $SAN_LIST"
+  info "SAN list (requested): $(san_entries | paste -sd, -)"
 
   local stamp
   stamp="$(date +%Y%m%d-%H%M%S)"
@@ -456,12 +653,13 @@ main() {
     exit 1
   fi
 
-  local san_openssl
-  san_openssl="$(build_san_openssl "$SAN_LIST")"
-
   # 4) Sign the server certificate. The CSR is always regenerated with the
   #    leaf, so a new key or a new --cn can never be paired with an old CSR.
   if [[ "$FORCE_REISSUE" -eq 1 || ! -f "$server_crt" || "$key_state" == "created" || "$int_state" == "created" ]]; then
+    local note
+    for note in ${NAME_NOTES[@]+"${NAME_NOTES[@]}"}; do
+      info "$note"
+    done
     info "Generating CSR -> $server_csr"
     rm -f "$server_csr"
     openssl req -new \
@@ -471,7 +669,7 @@ main() {
     chmod 644 "$server_csr"
 
     local extfile="$tmp_dir/server_ext.cnf"
-    write_server_extfile "$extfile" "$san_openssl"
+    write_server_extfile "$extfile" "$SAN_OPENSSL"
 
     info "Signing server certificate -> $server_crt"
     rm -f "$server_crt"

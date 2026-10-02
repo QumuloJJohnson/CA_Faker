@@ -40,6 +40,19 @@
 
 set -euo pipefail
 
+# Stock macOS bash 3.2 cannot parse the rest of this script, so this check
+# runs before any function is defined.
+if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "ERROR: macOS needs Homebrew bash and OpenSSL: brew install bash openssl@3, then run with PATH=\"\$(brew --prefix openssl@3)/bin:\$PATH\" bash $0 ..." >&2
+  else
+    echo "ERROR: bash 4 or newer is required; found bash $BASH_VERSION" >&2
+  fi
+  exit 1
+fi
+
+VERSION="2.0.0"
+
 CLIENTS_FILE=""
 CA_DIR=""             # directory created by CA creation tool (out-dir)
 CA_CERT=""            # resolved to CA_DIR/ca/ca.crt.pem
@@ -77,13 +90,18 @@ Optional:
                           container's own trust store tools. A host without
                           machinectl or without that running container gets a
                           WARNING and the container is skipped.
-  --verify-tls <h:p>     End-to-end TLS check against host:port after install
-                          (e.g. --verify-tls stratusdatacore.qumulotest.local:443)
+  --verify-tls <h:p>     End-to-end TLS check against host:port after install,
+                          from the host and the container. The chain AND the
+                          name (or IP) are checked. The port is required; put
+                          IPv6 in brackets.
+                          (e.g. --verify-tls stratusdatacore.qumulotest.local:443
+                           or --verify-tls [2001:db8::10]:443)
   --no-verify             Skip the check that the refreshed trust store
                           contains the CA (host and container)
   --trust-name <name>     Trust file name on targets, without .crt
                           (default: $TRUST_NAME)
   --timeout <sec>         SSH connect timeout (default: $CONNECT_TIMEOUT)
+  --version               Show version
   --help                  Show help
 
 EOF
@@ -94,6 +112,113 @@ info() { echo "INFO:  $*" >&2; }
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || { err "Missing required command: $1"; exit 1; }
+}
+
+# Stock macOS ships LibreSSL, which lacks -verify_hostname and -verify_ip;
+# fail with the fix instead of a confusing error later.
+preflight() {
+  need_cmd openssl
+  if [[ "$(openssl version)" != OpenSSL* ]]; then
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      err "macOS needs Homebrew bash and OpenSSL: brew install bash openssl@3, then run with PATH=\"\$(brew --prefix openssl@3)/bin:\$PATH\" bash $0 ..."
+    else
+      err "OpenSSL (not LibreSSL) is required; found $(openssl version)"
+    fi
+    exit 1
+  fi
+}
+
+# Same name rules as CA_Faker.sh; tests/run_tests.sh keeps the copies identical.
+is_ipv4() {
+  local o
+  [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do
+    [[ "$o" =~ ^(0|[1-9][0-9]*)$ ]] && (( 10#$o <= 255 )) || return 1
+  done
+}
+
+# Prints how many 16-bit groups one side of an IPv6 address holds (a
+# trailing dotted quad counts as 2); fails if a group is malformed.
+ipv6_groups() {
+  local s="$1" n=0 g last
+  local -a gs
+  [[ -z "$s" ]] && { echo 0; return 0; }
+  last="${s##*:}"
+  if [[ "$last" == *.* ]]; then
+    is_ipv4 "$last" || return 1
+    n=2
+    [[ "$s" == "$last" ]] && { echo 2; return 0; }
+    s="${s%:*}"
+  fi
+  [[ "$s" == *: || "$s" == :* ]] && return 1
+  IFS=: read -r -a gs <<< "$s"
+  for g in "${gs[@]}"; do
+    [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    n=$((n+1))
+  done
+  echo "$n"
+}
+
+is_ipv6() {
+  local a="$1" l r nl nr
+  [[ "$a" == *::*::* ]] && return 1
+  if [[ "$a" == *::* ]]; then
+    l="${a%%::*}"; r="${a#*::}"
+    [[ "$l" == *.* ]] && return 1
+    nl="$(ipv6_groups "$l")" || return 1
+    nr="$(ipv6_groups "$r")" || return 1
+    (( nl + nr <= 7 ))
+  else
+    nl="$(ipv6_groups "$a")" || return 1
+    (( nl == 8 ))
+  fi
+}
+
+is_ip_literal() {
+  is_ipv4 "$1" || is_ipv6 "$1"
+}
+
+# Browsers parse an all-digit or 0x-hex last label as a number (an IPv4
+# address), and only accept '*' as the whole leftmost label.
+is_dns_name() {
+  local n="$1" label last i
+  local -a labels
+  [[ ${#n} -ge 1 && ${#n} -le 253 ]] || return 1
+  [[ "$n" == .* || "$n" == *. || "$n" == *..* ]] && return 1
+  IFS=. read -r -a labels <<< "$n"
+  for i in "${!labels[@]}"; do
+    label="${labels[$i]}"
+    if [[ "$i" -eq 0 && "$label" == "*" ]]; then
+      [[ ${#labels[@]} -ge 3 ]] || return 1
+      continue
+    fi
+    [[ "$label" =~ ^[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$ ]] || return 1
+  done
+  last="${labels[${#labels[@]}-1]}"
+  [[ "$last" =~ ^[0-9]+$ ]] && return 1
+  [[ "$last" =~ ^0[xX][0-9A-Fa-f]*$ ]] && return 1
+  return 0
+}
+
+# --verify-tls is spliced into the root script and handed to s_client: an
+# empty host disables the name check and a missing port silently means 4433.
+check_verify_tls() {
+  local ep="$1" host="" port=""
+  local re_v6='^\[([^]]*)\]:([^:]*)$'
+  local re_name='^([^:]*):([^:]*)$'
+  if [[ "$ep" =~ $re_v6 ]]; then
+    host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    is_ipv6 "$host" || host=""
+  elif [[ "$ep" =~ $re_name ]]; then
+    host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    if [[ "$host" == *'*'* ]] || ! { is_ipv4 "$host" || is_dns_name "$host"; }; then
+      host=""
+    fi
+  fi
+  if [[ -z "$host" ]] || ! [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || [[ "$port" -gt 65535 ]]; then
+    err "--verify-tls must be host:port with a valid name or IP (IPv6 in brackets), e.g. stratusdatacore.qumulotest.local:443 or [2001:db8::10]:443; got '$ep'"
+    exit 1
+  fi
 }
 
 cleanup() {
@@ -117,6 +242,7 @@ parse_args() {
       --no-verify) VERIFY=0; shift 1 ;;
       --trust-name) TRUST_NAME="${2:-}"; shift 2 ;;
       --timeout) CONNECT_TIMEOUT="${2:-}"; shift 2 ;;
+      --version) echo "$(basename "$0") $VERSION"; exit 0 ;;
       --help|-h) usage; exit 0 ;;
       *) err "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -159,6 +285,9 @@ parse_args() {
   fi
   if ! [[ "$TRUST_NAME" =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*$ ]]; then
     err "--trust-name must start with a letter, digit, '_' or '-' and contain only those and '.'"; exit 1
+  fi
+  if [[ -n "$VERIFY_TLS" ]]; then
+    check_verify_tls "$VERIFY_TLS"
   fi
 }
 
@@ -368,6 +497,26 @@ trust_install() {
   fi
 }
 
+# Validate a TLS endpoint with this machine's default trust store, checking
+# the chain AND the name: IP literals with -verify_ip (and no SNI), names
+# with -servername and -verify_hostname.
+tls_check() {
+  local ep="$1" h out
+  local -a name_opts
+  h="${ep%:*}"; h="${h#[}"; h="${h%]}"
+  if [[ "$h" == *:* || "$h" =~ ^[0-9.]+$ ]]; then
+    name_opts=(-verify_ip "$h")
+  else
+    name_opts=(-servername "$h" -verify_hostname "$h")
+  fi
+  if out=$(echo | timeout 15 openssl s_client -connect "$ep" "${name_opts[@]}" -verify_return_error -brief 2>&1); then
+    printf '%s\n' "$out" | sed -n '1,3p'
+    return 0
+  fi
+  printf '%s\n' "$out" >&2
+  return 1
+}
+
 CERT="$(mktemp)"
 trap 'rm -f "$CERT"' EXIT
 echo '__B64_CERT__' | base64 -d > "$CERT"
@@ -401,13 +550,10 @@ if [ -n "$CONTAINER" ]; then
     if [ -n "$VERIFY_TLS_EP" ]; then
       echo ""
       echo "TLS verify (container $CONTAINER -> $VERIFY_TLS_EP):"
-      if out=$(nsenter -t "$LEADER" -m -p -u -n -- bash -c \
-        "echo | timeout 15 openssl s_client -connect '$VERIFY_TLS_EP' -verify_return_error -brief 2>&1"); then
-        printf '%s\n' "$out" | sed -n '1,3p'
-        echo "TLS OK (container)"
+      if nsenter -t "$LEADER" -m -p -u -n -- bash -c "$(declare -f tls_check); tls_check \"\$1\"" _ "$VERIFY_TLS_EP"; then
+        echo "TLS OK (container $CONTAINER): chain and name validated for $VERIFY_TLS_EP"
       else
-        printf '%s\n' "$out" >&2
-        echo "ERROR: TLS verification failed inside container $CONTAINER" >&2
+        echo "ERROR: trust store installed OK, but TLS endpoint $VERIFY_TLS_EP did not validate in container $CONTAINER (expected if the cert has not been applied to the cluster yet — README step 4)" >&2
         exit 1
       fi
     fi
@@ -418,12 +564,10 @@ fi
 if [ -n "$VERIFY_TLS_EP" ]; then
   echo ""
   echo "TLS verify (host -> $VERIFY_TLS_EP):"
-  if out=$(echo | timeout 15 openssl s_client -connect "$VERIFY_TLS_EP" -verify_return_error -brief 2>&1); then
-    printf '%s\n' "$out" | sed -n '1,3p'
-    echo "TLS OK (host)"
+  if tls_check "$VERIFY_TLS_EP"; then
+    echo "TLS OK (host): chain and name validated for $VERIFY_TLS_EP"
   else
-    printf '%s\n' "$out" >&2
-    echo "ERROR: TLS verification failed on host" >&2
+    echo "ERROR: trust store installed OK, but TLS endpoint $VERIFY_TLS_EP did not validate (expected if the cert has not been applied to the cluster yet — README step 4)" >&2
     exit 1
   fi
 fi
@@ -445,9 +589,9 @@ RSCRIPT
 }
 
 main() {
+  preflight
   need_cmd ssh
   need_cmd scp
-  need_cmd openssl
 
   parse_args "$@"
   load_hosts
