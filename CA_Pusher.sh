@@ -14,8 +14,10 @@
 #   3) prompts for SSH auth method (key or password)
 #   4) prompts for the remote sudo password (user is NOT passwordless sudoer)
 #   5) copies the CA cert to each client
-#   6) installs it into Ubuntu trust store (/usr/local/share/ca-certificates)
-#   7) runs update-ca-certificates
+#   6) installs it into the system trust store: Ubuntu/Debian
+#      (/usr/local/share/ca-certificates, update-ca-certificates) or
+#      RHEL/Rocky/Alma (/etc/pki/ca-trust/source/anchors, update-ca-trust)
+#   7) proves the refreshed system bundle contains it (skip with --no-verify)
 #
 # Requirements (on Cluster A):
 #   - bash, ssh, scp, openssl
@@ -48,6 +50,7 @@ SSH_KEY_PATH=""       # used if AUTH_MODE=key (optional)
 VERIFY=1
 CONTAINER=""          # systemd-nspawn container name (e.g. "qcore")
 VERIFY_TLS=""         # optional host:port for end-to-end TLS check
+TRUST_NAME="company-lab-root-ca"   # trust file name on targets (.crt is appended)
 CONNECT_TIMEOUT=8
 
 # In-memory secrets
@@ -70,10 +73,16 @@ Optional:
   --auth password         Use password SSH auth (requires sshpass)
   --key <path>            SSH private key path (for --auth key)
   --container <name>      Also install cert into a systemd-nspawn container
-                          on each host (e.g. --container qcore)
+                          on each host (e.g. --container qcore), using the
+                          container's own trust store tools. A host without
+                          machinectl or without that running container gets a
+                          WARNING and the container is skipped.
   --verify-tls <h:p>     End-to-end TLS check against host:port after install
                           (e.g. --verify-tls stratusdatacore.qumulotest.local:443)
-  --no-verify             Skip verification step
+  --no-verify             Skip the check that the refreshed trust store
+                          contains the CA (host and container)
+  --trust-name <name>     Trust file name on targets, without .crt
+                          (default: $TRUST_NAME)
   --timeout <sec>         SSH connect timeout (default: $CONNECT_TIMEOUT)
   --help                  Show help
 
@@ -106,6 +115,7 @@ parse_args() {
       --container) CONTAINER="${2:-}"; shift 2 ;;
       --verify-tls) VERIFY_TLS="${2:-}"; shift 2 ;;
       --no-verify) VERIFY=0; shift 1 ;;
+      --trust-name) TRUST_NAME="${2:-}"; shift 2 ;;
       --timeout) CONNECT_TIMEOUT="${2:-}"; shift 2 ;;
       --help|-h) usage; exit 0 ;;
       *) err "Unknown option: $1"; usage; exit 1 ;;
@@ -146,6 +156,9 @@ parse_args() {
   # The name is spliced into the root script, so only plain names are allowed.
   if [[ -n "$CONTAINER" && ! "$CONTAINER" =~ ^[A-Za-z0-9._-]+$ ]]; then
     err "--container must contain only letters, digits, '.', '_' and '-'"; exit 1
+  fi
+  if ! [[ "$TRUST_NAME" =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*$ ]]; then
+    err "--trust-name must start with a letter, digit, '_' or '-' and contain only those and '.'"; exit 1
   fi
 }
 
@@ -279,7 +292,7 @@ _rc=\$?; rm -f \"\$_S\"; exit \$_rc"
 install_on_node() {
   local host="$1"
 
-  info "[$host] installing CA into Ubuntu trust store (sudo required)"
+  info "[$host] installing CA into system trust store (sudo required)"
 
   # Embed the CA cert directly in the payload — avoids SCP and the
   # temp-file permission issue (previous runs leave root-owned files in /tmp).
@@ -288,43 +301,99 @@ install_on_node() {
 
   local root_script
   root_script="$(cat <<'RSCRIPT'
+exec </dev/null
 set -euo pipefail
-DST="/usr/local/share/ca-certificates/company-lab-root-ca.crt"
+CONTAINER="__CONTAINER__"
+VERIFY_TLS_EP="__VERIFY_TLS__"
+VERIFY_TRUST="__VERIFY__"
+TRUST_NAME="__TRUST_NAME__"
 
-echo '__B64_CERT__' | base64 -d > "$DST"
-chmod 0644 "$DST"
+# Normalised SHA-256 of a PEM cert; empty when the file is not a readable cert.
+fp_of() {
+  openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 | tr -d : | tr a-f A-F || true
+}
 
-openssl x509 -in "$DST" -noout >/dev/null 2>&1 || { echo "Bad CA cert at $DST" >&2; exit 1; }
+# Install the lab root (PEM on stdin) into this machine's trust store and,
+# when verify=1, prove the refreshed system bundle contains it. Runs on the
+# host directly and inside the container through nsenter, so each side uses
+# its own tools and paths. Callers run it in an `if`, where set -e does not
+# apply, so every step returns on failure.
+trust_install() {
+  local label="$1" where="$2" name="$3" verify="$4"
+  local dst refresh bundle tmp new_fp old_fp
+  if command -v update-ca-certificates >/dev/null 2>&1; then
+    echo "$label: Ubuntu-family (update-ca-certificates)"
+    dst="/usr/local/share/ca-certificates/$name.crt"
+    refresh="update-ca-certificates"
+    bundle="/etc/ssl/certs/ca-certificates.crt"
+  elif command -v update-ca-trust >/dev/null 2>&1; then
+    echo "$label: RHEL-family (update-ca-trust)"
+    dst="/etc/pki/ca-trust/source/anchors/$name.crt"
+    refresh="update-ca-trust extract"
+    bundle="/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+  else
+    echo "ERROR: No supported trust store tool found (need update-ca-certificates or update-ca-trust)" >&2
+    return 1
+  fi
+  if ! command -v openssl >/dev/null 2>&1; then
+    echo "ERROR: openssl not found on $where; install it (apt/dnf install openssl)" >&2
+    return 1
+  fi
+  tmp="$(mktemp)" || return 1
+  cat > "$tmp" || { rm -f "$tmp"; return 1; }
+  new_fp="$(fp_of "$tmp")"
+  if [ -z "$new_fp" ]; then
+    echo "ERROR: Bad CA cert" >&2; rm -f "$tmp"; return 1
+  fi
+  if [ -f "$dst" ]; then
+    old_fp="$(fp_of "$dst")"
+    if [ "$old_fp" != "$new_fp" ]; then
+      echo "WARNING: replacing a different lab's root on $where ($dst)" >&2
+    fi
+  fi
+  cat "$tmp" > "$dst" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  chmod 0644 "$dst" || return 1
+  $refresh >/dev/null || { echo "ERROR: $refresh failed on $where" >&2; return 1; }
+  echo "Installed: $dst"
+  openssl x509 -in "$dst" -noout -subject -fingerprint -sha256 || return 1
+  if [ "$verify" = 1 ]; then
+    # -trusted, not -CAfile: -CAfile also consults the default CA path, so it
+    # can pass for a cert that is not in the bundle.
+    if ! openssl verify -trusted "$bundle" "$dst" >/dev/null 2>&1; then
+      echo "ERROR: lab root not found in $bundle on $where after $refresh" >&2
+      return 1
+    fi
+    echo "Verified: lab root is in $bundle"
+  fi
+}
 
-update-ca-certificates >/dev/null
+CERT="$(mktemp)"
+trap 'rm -f "$CERT"' EXIT
+echo '__B64_CERT__' | base64 -d > "$CERT"
 
-echo "Installed: $DST"
-openssl x509 -in "$DST" -noout -subject -fingerprint -sha256
+if ! trust_install "Trust store" "host" "$TRUST_NAME" "$VERIFY_TRUST" < "$CERT"; then
+  exit 1
+fi
 
 # Clean up stale temp file from older script versions
 rm -f /tmp/company-lab-root-ca.crt
 
 # Install into systemd-nspawn container if requested
-CONTAINER="__CONTAINER__"
-VERIFY_TLS_EP="__VERIFY_TLS__"
 if [ -n "$CONTAINER" ]; then
   echo ""
   echo "Installing CA cert into nspawn container: $CONTAINER"
-  if machinectl status "$CONTAINER" >/dev/null 2>&1; then
+  if ! command -v machinectl >/dev/null 2>&1; then
+    echo "WARNING: container '$CONTAINER' skipped: machinectl not found (install systemd-container)" >&2
+  elif ! machinectl status "$CONTAINER" >/dev/null 2>&1; then
+    echo "WARNING: container '$CONTAINER' is not running — skipped" >&2
+  else
     LEADER=$(machinectl show "$CONTAINER" -p Leader --value)
 
-    machinectl copy-to "$CONTAINER" "$DST" "$DST"
-
-    nsenter -t "$LEADER" -m -p -u -- bash -c \
-      "chmod 0644 '$DST' && update-ca-certificates >/dev/null"
-
-    # Verify the cert actually landed in the trust store
-    if nsenter -t "$LEADER" -m -p -u -- ls /etc/ssl/certs/ | grep -qi company-lab-root-ca; then
-      echo "Installed in container $CONTAINER: $DST"
-      nsenter -t "$LEADER" -m -p -u -- \
-        openssl x509 -in "$DST" -noout -subject -fingerprint -sha256
-    else
-      echo "ERROR: cert not found in container trust store after update-ca-certificates" >&2
+    # Same function, run inside the container's namespaces with its own tools.
+    if ! nsenter -t "$LEADER" -m -p -u -- bash -c "$(declare -f fp_of trust_install); trust_install \"\$@\"" _ \
+        "Container $CONTAINER trust store" "container $CONTAINER" "$TRUST_NAME" "$VERIFY_TRUST" < "$CERT"; then
+      echo "ERROR: CA cert could not be installed in container $CONTAINER" >&2
       exit 1
     fi
 
@@ -342,8 +411,6 @@ if [ -n "$CONTAINER" ]; then
         exit 1
       fi
     fi
-  else
-    echo "WARNING: container '$CONTAINER' is not running — skipped" >&2
   fi
 fi
 
@@ -365,10 +432,16 @@ RSCRIPT
   root_script="${root_script/__B64_CERT__/$b64_cert}"
   root_script="${root_script/__CONTAINER__/$CONTAINER}"
   root_script="${root_script/__VERIFY_TLS__/$VERIFY_TLS}"
+  root_script="${root_script/__VERIFY__/$VERIFY}"
+  root_script="${root_script/__TRUST_NAME__/$TRUST_NAME}"
 
   run_remote_sudo_script "$host" "$root_script" || return 1
 
-  info "[$host] done"
+  if [[ "$VERIFY" -eq 1 ]]; then
+    info "[$host] done"
+  else
+    info "[$host] done (trust store NOT verified: --no-verify)"
+  fi
 }
 
 main() {
@@ -417,6 +490,9 @@ main() {
   echo "Total: $total"
   echo "OK:    $ok"
   echo "Fail:  $fail"
+  if [[ "$VERIFY" -eq 0 ]]; then
+    echo "Note: --no-verify was set; trust stores were not verified."
+  fi
   if [[ "$fail" -gt 0 ]]; then
     echo
     echo "Failed nodes:"

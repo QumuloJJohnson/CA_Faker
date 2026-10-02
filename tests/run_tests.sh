@@ -156,6 +156,28 @@ test_pusher_unreachable_host_counts_failed() {
   assert_not_contains "[127.0.0.1] done"
 }
 
+test_pusher_rejects_bad_trust_name() {
+  make_plain_ca od
+  echo "node1.qumulotest.local" > clients.txt
+  local bad
+  for bad in "" ".hidden" "a/b" "lab ca" 'x&y'; do
+    run_cmd "$PUSHER" --clients clients.txt --ca od --ssh-user u --auth key --trust-name "$bad"
+    assert_rc 1
+    assert_contains "ERROR: --trust-name must"
+  done
+}
+
+# Placeholders are replaced with ${var/pattern/value}, which only replaces
+# the first match: each must appear exactly once in the root script.
+test_pusher_placeholders_appear_once() {
+  sed -n "/<<'RSCRIPT'/,/^RSCRIPT$/p" "$PUSHER" > root_script.sh
+  local ph n
+  for ph in __B64_CERT__ __CONTAINER__ __VERIFY_TLS__ __VERIFY__ __TRUST_NAME__; do
+    n="$(grep -o "$ph" root_script.sh | wc -l | tr -d ' ')"
+    assert_eq "$n" 1 "count of $ph"
+  done
+}
+
 run_test() {
   local t="$1"
   T_FAILED=0
