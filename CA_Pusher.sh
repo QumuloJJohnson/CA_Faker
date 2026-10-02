@@ -143,6 +143,24 @@ parse_args() {
   if [[ -n "$SSH_KEY_PATH" && ! -f "$SSH_KEY_PATH" ]]; then
     err "--key path not found: $SSH_KEY_PATH"; exit 1
   fi
+  # The name is spliced into the root script, so only plain names are allowed.
+  if [[ -n "$CONTAINER" && ! "$CONTAINER" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    err "--container must contain only letters, digits, '.', '_' and '-'"; exit 1
+  fi
+}
+
+# Read the clients file up front so an empty file fails before any prompt.
+load_hosts() {
+  local line
+  HOSTS=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(echo "$line" | sed -e 's/#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [[ -z "$line" ]] && continue
+    HOSTS+=("$line")
+  done < "$CLIENTS_FILE"
+  if [[ ${#HOSTS[@]} -eq 0 ]]; then
+    err "No hosts found in $CLIENTS_FILE"; exit 1
+  fi
 }
 
 prompt_creds() {
@@ -191,22 +209,6 @@ prompt_creds() {
 
 ssh_opts_base() {
   echo "-p ${SSH_PORT} -o ConnectTimeout=${CONNECT_TIMEOUT} -o StrictHostKeyChecking=accept-new"
-}
-
-# Run a remote command as the SSH user (no sudo). Allocates TTY.
-run_ssh_user() {
-  local host="$1"; shift
-  local opts; opts="$(ssh_opts_base)"
-
-  if [[ "$AUTH_MODE" == "password" ]]; then
-    sshpass -e ssh -tt $opts -o BatchMode=no "${SSH_USER}@${host}" "$@"
-  else
-    if [[ -n "$SSH_KEY_PATH" ]]; then
-      ssh -tt $opts -o BatchMode=yes -i "$SSH_KEY_PATH" "${SSH_USER}@${host}" "$@"
-    else
-      ssh -tt $opts -o BatchMode=yes "${SSH_USER}@${host}" "$@"
-    fi
-  fi
 }
 
 # Run a remote command without TTY allocation (for non-interactive scripts).
@@ -265,10 +267,10 @@ run_remote_sudo_script() {
   #   4. clean up and propagate the exit code
   local remote_cmd
   remote_cmd="read -r _PW \
-&& echo '${b64_script}' | base64 -d > /tmp/_ca_push_script.sh \
-&& chmod 600 /tmp/_ca_push_script.sh \
-&& printf '%s\\n' \"\$_PW\" | sudo -S bash /tmp/_ca_push_script.sh; \
-_rc=\$?; rm -f /tmp/_ca_push_script.sh; exit \$_rc"
+&& _S=\$(mktemp) \
+&& echo '${b64_script}' | base64 -d > \"\$_S\" \
+&& printf '%s\\n' \"\$_PW\" | sudo -S bash \"\$_S\"; \
+_rc=\$?; rm -f \"\$_S\"; exit \$_rc"
 
   # Pipe the sudo password as stdin; use no-TTY ssh to prevent interactive shell
   printf '%s\n' "$SUDO_PASS" | run_ssh_no_tty "$host" "$remote_cmd"
@@ -282,7 +284,7 @@ install_on_node() {
   # Embed the CA cert directly in the payload — avoids SCP and the
   # temp-file permission issue (previous runs leave root-owned files in /tmp).
   local b64_cert
-  b64_cert="$(base64 < "$CA_CERT" | tr -d '\n')"
+  b64_cert="$(base64 < "$CA_CERT" | tr -d '\n')" || return 1
 
   local root_script
   root_script="$(cat <<'RSCRIPT'
@@ -330,10 +332,12 @@ if [ -n "$CONTAINER" ]; then
     if [ -n "$VERIFY_TLS_EP" ]; then
       echo ""
       echo "TLS verify (container $CONTAINER -> $VERIFY_TLS_EP):"
-      if nsenter -t "$LEADER" -m -p -u -n -- bash -c \
-        "echo | openssl s_client -connect '$VERIFY_TLS_EP' -verify_return_error -brief 2>&1 | head -3"; then
+      if out=$(nsenter -t "$LEADER" -m -p -u -n -- bash -c \
+        "echo | timeout 15 openssl s_client -connect '$VERIFY_TLS_EP' -verify_return_error -brief 2>&1"); then
+        printf '%s\n' "$out" | sed -n '1,3p'
         echo "TLS OK (container)"
       else
+        printf '%s\n' "$out" >&2
         echo "ERROR: TLS verification failed inside container $CONTAINER" >&2
         exit 1
       fi
@@ -347,25 +351,22 @@ fi
 if [ -n "$VERIFY_TLS_EP" ]; then
   echo ""
   echo "TLS verify (host -> $VERIFY_TLS_EP):"
-  if echo | openssl s_client -connect "$VERIFY_TLS_EP" -verify_return_error -brief 2>&1 | head -3; then
+  if out=$(echo | timeout 15 openssl s_client -connect "$VERIFY_TLS_EP" -verify_return_error -brief 2>&1); then
+    printf '%s\n' "$out" | sed -n '1,3p'
     echo "TLS OK (host)"
   else
+    printf '%s\n' "$out" >&2
     echo "ERROR: TLS verification failed on host" >&2
     exit 1
   fi
 fi
 RSCRIPT
-)"
+)" || return 1
   root_script="${root_script/__B64_CERT__/$b64_cert}"
   root_script="${root_script/__CONTAINER__/$CONTAINER}"
   root_script="${root_script/__VERIFY_TLS__/$VERIFY_TLS}"
 
-  run_remote_sudo_script "$host" "$root_script"
-
-  if [[ "$VERIFY" -eq 1 ]]; then
-    info "[$host] verify: best-effort check in /etc/ssl/certs"
-    run_ssh_user "$host" "ls -1 /etc/ssl/certs | grep -i 'company-lab-root-ca' || true"
-  fi
+  run_remote_sudo_script "$host" "$root_script" || return 1
 
   info "[$host] done"
 }
@@ -376,6 +377,7 @@ main() {
   need_cmd openssl
 
   parse_args "$@"
+  load_hosts
   prompt_creds
 
   info "CA tool output dir: $CA_DIR"
@@ -392,10 +394,8 @@ main() {
   local total=0 ok=0 fail=0
   local failures=()
 
-  while IFS= read -r host <&3 || [[ -n "$host" ]]; do
-    host="$(echo "$host" | sed -e 's/#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    [[ -z "$host" ]] && continue
-
+  local host
+  for host in "${HOSTS[@]}"; do
     total=$((total+1))
     echo "=============================="
     echo "Target: $host"
@@ -409,7 +409,7 @@ main() {
       err "[$host] failed (continuing)"
     fi
     echo
-  done 3< "$CLIENTS_FILE"
+  done
 
   echo "=============================="
   echo "Summary"
