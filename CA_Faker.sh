@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# configure_clusterA_qumulo_tls_ubuntu.sh
+# configure_clusterA_qumulo_tls.sh
 #
-# Ubuntu-only script to prepare TLS materials for Qumulo Cluster A
+# Prepares TLS materials for Qumulo Cluster A (needs bash 4+; runs on Ubuntu
+# and Rocky 9.3 / OpenSSL 3.0.7)
 # up to (but NOT including) running `qq ssl_modify_certificate`.
 #
 # REQUIRED: --cn <fqdn>
@@ -11,6 +12,7 @@
 #   certbundle.pem         (leaf cert + root CA, Qumulo-required order)
 #   ca/ca.crt.pem          (root CA cert to distribute to Cluster B nodes)
 #   ca/ca.key.pem          (root CA private key - protect!)
+#   ca/ca.srl              (CA serial number file)
 #
 # Example:
 #   ./CA_Faker.sh \
@@ -59,6 +61,7 @@ Outputs (in --out-dir):
   certbundle.pem
   ca/ca.crt.pem
   ca/ca.key.pem
+  ca/ca.srl
   issued/server.crt.pem
   csr/server.csr.pem
 
@@ -171,6 +174,9 @@ main() {
 
   local ca_key="$ca_dir/ca.key.pem"
   local ca_crt="$ca_dir/ca.crt.pem"
+  # Explicit serial path: the default is derived from the CA file name and
+  # differs between OpenSSL/LibreSSL versions (some write ./.srl in the CWD)
+  local ca_srl="$ca_dir/ca.srl"
 
   local server_key="$OUT_DIR/private.key.insecure"
   local server_csr="$csr_dir/server.csr.pem"
@@ -242,7 +248,7 @@ main() {
       -in "$server_csr" \
       -CA "$ca_crt" \
       -CAkey "$ca_key" \
-      -CAcreateserial \
+      -CAserial "$ca_srl" -CAcreateserial \
       -out "$server_crt" \
       -days "$SERVER_DAYS" \
       -sha256 \
@@ -273,7 +279,8 @@ Files created for Qumulo Step 4 (do NOT run here):
   $server_key
   $certbundle
 
-Distribute this CA cert to Cluster B nodes and install into Ubuntu trust store:
+Distribute this CA cert to Cluster B nodes and install it into their system
+trust store (CA_Pusher.sh does this for Ubuntu/Debian and Rocky/RHEL):
   $ca_crt
 
 Next step (manual): run the Qumulo doc Step 4 command:

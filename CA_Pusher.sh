@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# push_ca_trust_to_clusterB_ubuntu.sh
+# push_ca_trust_to_clusterB.sh
 #
 # Run this on Cluster A.
 #
@@ -14,13 +14,16 @@
 #   3) prompts for SSH auth method (key or password)
 #   4) prompts for the remote sudo password (user is NOT passwordless sudoer)
 #   5) copies the CA cert to each client
-#   6) installs it into Ubuntu trust store (/usr/local/share/ca-certificates)
-#   7) runs update-ca-certificates
+#   6) installs it into the system trust store, detected per host (and per container):
+#        Ubuntu/Debian:      /usr/local/share/ca-certificates      + update-ca-certificates
+#        Rocky/RHEL/Fedora:  /etc/pki/ca-trust/source/anchors      + update-ca-trust extract
+#   7) verifies the CA is trusted by the system store (openssl verify)
 #
 # Requirements (on Cluster A):
 #   - bash, ssh, scp, openssl
 #   - OPTIONAL: sshpass (only if using password-based SSH)
-#       sudo apt-get update && sudo apt-get install -y sshpass
+#       Ubuntu/Debian:  sudo apt-get update && sudo apt-get install -y sshpass
+#       Rocky/RHEL:     sudo dnf install -y epel-release && sudo dnf install -y sshpass
 #
 # Usage:
 #   ./CA_Pusher.sh \
@@ -35,6 +38,8 @@
 # - We do NOT place the password on any command line; it is passed via stdin.
 # - The root script is base64-encoded and decoded on the remote side to avoid
 #   quoting and stdin conflicts with the sudo password delivery.
+# - A host counts as OK only if the install (and, unless --no-verify, the trust
+#   check and any --verify-tls check) succeeded; failures exit 2.
 
 set -euo pipefail
 
@@ -71,9 +76,10 @@ Optional:
   --key <path>            SSH private key path (for --auth key)
   --container <name>      Also install cert into a systemd-nspawn container
                           on each host (e.g. --container qcore)
-  --verify-tls <h:p>     End-to-end TLS check against host:port after install
+  --verify-tls <h:p>     End-to-end TLS check against host:port after install, from
+                          the host and the container; the cert must match host
                           (e.g. --verify-tls stratusdatacore.qumulotest.local:443)
-  --no-verify             Skip verification step
+  --no-verify             Skip the post-install system trust check
   --timeout <sec>         SSH connect timeout (default: $CONNECT_TIMEOUT)
   --help                  Show help
 
@@ -137,6 +143,12 @@ parse_args() {
   if ! [[ "$CONNECT_TIMEOUT" =~ ^[0-9]+$ ]] || [[ "$CONNECT_TIMEOUT" -lt 1 ]]; then
     err "--timeout must be a positive integer"; exit 1
   fi
+  # Without a port, openssl s_client silently uses 4433, so require host:port
+  if [[ -n "$VERIFY_TLS" ]]; then
+    if ! [[ "$VERIFY_TLS" =~ ^(.+):([0-9]+)$ ]] || [[ "${BASH_REMATCH[2]}" -lt 1 || "${BASH_REMATCH[2]}" -gt 65535 ]]; then
+      err "--verify-tls must be host:port (e.g. jjdc.qumulotest.local:443), got '$VERIFY_TLS'"; exit 1
+    fi
+  fi
   if [[ -n "$AUTH_MODE" && "$AUTH_MODE" != "key" && "$AUTH_MODE" != "password" ]]; then
     err "--auth must be 'key' or 'password'"; exit 1
   fi
@@ -193,22 +205,6 @@ ssh_opts_base() {
   echo "-p ${SSH_PORT} -o ConnectTimeout=${CONNECT_TIMEOUT} -o StrictHostKeyChecking=accept-new"
 }
 
-# Run a remote command as the SSH user (no sudo). Allocates TTY.
-run_ssh_user() {
-  local host="$1"; shift
-  local opts; opts="$(ssh_opts_base)"
-
-  if [[ "$AUTH_MODE" == "password" ]]; then
-    sshpass -e ssh -tt $opts -o BatchMode=no "${SSH_USER}@${host}" "$@"
-  else
-    if [[ -n "$SSH_KEY_PATH" ]]; then
-      ssh -tt $opts -o BatchMode=yes -i "$SSH_KEY_PATH" "${SSH_USER}@${host}" "$@"
-    else
-      ssh -tt $opts -o BatchMode=yes "${SSH_USER}@${host}" "$@"
-    fi
-  fi
-}
-
 # Run a remote command without TTY allocation (for non-interactive scripts).
 # Stdin is forwarded to the remote command, so callers can pipe data in.
 run_ssh_no_tty() {
@@ -260,15 +256,15 @@ run_remote_sudo_script() {
 
   # Remote command sequence:
   #   1. read the sudo password from stdin (first and only line)
-  #   2. decode the base64 payload into a temp script
-  #   3. run the temp script under sudo -S (password piped in)
+  #   2. decode the base64 payload into a private temp script (mktemp)
+  #   3. run the temp script under sudo -S (password piped in, no prompt text)
   #   4. clean up and propagate the exit code
   local remote_cmd
   remote_cmd="read -r _PW \
-&& echo '${b64_script}' | base64 -d > /tmp/_ca_push_script.sh \
-&& chmod 600 /tmp/_ca_push_script.sh \
-&& printf '%s\\n' \"\$_PW\" | sudo -S bash /tmp/_ca_push_script.sh; \
-_rc=\$?; rm -f /tmp/_ca_push_script.sh; exit \$_rc"
+&& _F=\$(mktemp) \
+&& echo '${b64_script}' | base64 -d > \"\$_F\" \
+&& printf '%s\\n' \"\$_PW\" | sudo -S -p '' bash \"\$_F\"; \
+_rc=\$?; rm -f \"\$_F\"; exit \$_rc"
 
   # Pipe the sudo password as stdin; use no-TTY ssh to prevent interactive shell
   printf '%s\n' "$SUDO_PASS" | run_ssh_no_tty "$host" "$remote_cmd"
@@ -277,7 +273,7 @@ _rc=\$?; rm -f /tmp/_ca_push_script.sh; exit \$_rc"
 install_on_node() {
   local host="$1"
 
-  info "[$host] installing CA into Ubuntu trust store (sudo required)"
+  info "[$host] installing CA into system trust store (sudo required)"
 
   # Embed the CA cert directly in the payload — avoids SCP and the
   # temp-file permission issue (previous runs leave root-owned files in /tmp).
@@ -287,56 +283,87 @@ install_on_node() {
   local root_script
   root_script="$(cat <<'RSCRIPT'
 set -euo pipefail
-DST="/usr/local/share/ca-certificates/company-lab-root-ca.crt"
+CA_PEM="$(echo '__B64_CERT__' | base64 -d)"
+CONTAINER="__CONTAINER__"
+VERIFY_TLS_EP="__VERIFY_TLS__"
+DO_VERIFY="__VERIFY__"
 
-echo '__B64_CERT__' | base64 -d > "$DST"
-chmod 0644 "$DST"
-
+# Installs the CA (PEM on stdin) into the system trust store of whatever root
+# filesystem it runs in, choosing the layout by what that system provides.
+# Runs on the host and, via nsenter, inside the container (which may be a
+# different distro), so it is plain POSIX sh. $1 = 1 to verify trust afterwards.
+INSTALL_SH='
+set -eu
+NAME=company-lab-root-ca
+if command -v update-ca-certificates >/dev/null 2>&1 && [ -d /usr/local/share/ca-certificates ]; then
+  # Ubuntu / Debian
+  DST=/usr/local/share/ca-certificates/$NAME.crt
+  cat > "$DST"; chmod 0644 "$DST"
+  update-ca-certificates >/dev/null
+elif command -v update-ca-trust >/dev/null 2>&1 && [ -d /etc/pki/ca-trust/source/anchors ]; then
+  # Rocky / RHEL / Fedora
+  DST=/etc/pki/ca-trust/source/anchors/$NAME.crt
+  cat > "$DST"; chmod 0644 "$DST"
+  if command -v restorecon >/dev/null 2>&1; then restorecon "$DST" || true; fi
+  update-ca-trust extract
+else
+  echo "ERROR: no supported trust store (need update-ca-certificates or update-ca-trust)" >&2
+  exit 1
+fi
 openssl x509 -in "$DST" -noout >/dev/null 2>&1 || { echo "Bad CA cert at $DST" >&2; exit 1; }
-
-update-ca-certificates >/dev/null
-
 echo "Installed: $DST"
 openssl x509 -in "$DST" -noout -subject -fingerprint -sha256
+if [ "$1" = 1 ]; then
+  # A self-signed root only verifies if the default system store trusts it
+  if openssl verify "$DST" >/dev/null 2>&1; then
+    echo "Trusted by system store: yes"
+  else
+    echo "ERROR: $DST is not trusted by the system store after update" >&2
+    exit 1
+  fi
+fi
+'
+
+# Name the server cert must match: the endpoint host ([v6] brackets stripped),
+# checked as an IP SAN for IP literals and as a DNS name otherwise
+EP_HOST="${VERIFY_TLS_EP%:*}"; EP_HOST="${EP_HOST#[}"; EP_HOST="${EP_HOST%]}"
+if [[ "$EP_HOST" =~ ^[0-9.]+$ || "$EP_HOST" == *:* ]]; then NAME_OPT=-verify_ip; else NAME_OPT=-verify_hostname; fi
+
+# tls_check <label> [command prefix...]: handshake to VERIFY_TLS_EP must verify,
+# including the certificate matching EP_HOST
+tls_check() {
+  local label="$1" out; shift
+  echo ""
+  echo "TLS verify ($label -> $VERIFY_TLS_EP):"
+  if out="$("$@" sh -c 'echo | openssl s_client -connect "$1" -verify_return_error "$2" "$3" -brief 2>&1' \
+              sh "$VERIFY_TLS_EP" "$NAME_OPT" "$EP_HOST")"; then
+    printf '%s\n' "$out" | grep -E '^(Protocol version|Verification|Verified peername)' || true
+    echo "TLS OK ($label)"
+  else
+    printf '%s\n' "$out" | tail -5 >&2
+    echo "ERROR: TLS verification failed ($label)" >&2
+    return 1
+  fi
+}
+
+printf '%s\n' "$CA_PEM" | sh -c "$INSTALL_SH" sh "$DO_VERIFY"
+
+# TLS checks don't stop at the first failure, so one run shows whether the
+# host, the container, or both can't reach/verify the endpoint
+TLS_FAILED=0
 
 # Clean up stale temp file from older script versions
 rm -f /tmp/company-lab-root-ca.crt
 
 # Install into systemd-nspawn container if requested
-CONTAINER="__CONTAINER__"
-VERIFY_TLS_EP="__VERIFY_TLS__"
 if [ -n "$CONTAINER" ]; then
   echo ""
   echo "Installing CA cert into nspawn container: $CONTAINER"
   if machinectl status "$CONTAINER" >/dev/null 2>&1; then
     LEADER=$(machinectl show "$CONTAINER" -p Leader --value)
-
-    machinectl copy-to "$CONTAINER" "$DST" "$DST"
-
-    nsenter -t "$LEADER" -m -p -u -- bash -c \
-      "chmod 0644 '$DST' && update-ca-certificates >/dev/null"
-
-    # Verify the cert actually landed in the trust store
-    if nsenter -t "$LEADER" -m -p -u -- ls /etc/ssl/certs/ | grep -qi company-lab-root-ca; then
-      echo "Installed in container $CONTAINER: $DST"
-      nsenter -t "$LEADER" -m -p -u -- \
-        openssl x509 -in "$DST" -noout -subject -fingerprint -sha256
-    else
-      echo "ERROR: cert not found in container trust store after update-ca-certificates" >&2
-      exit 1
-    fi
-
-    # End-to-end TLS check inside the container
+    printf '%s\n' "$CA_PEM" | nsenter -t "$LEADER" -m -p -u -- sh -c "$INSTALL_SH" sh "$DO_VERIFY"
     if [ -n "$VERIFY_TLS_EP" ]; then
-      echo ""
-      echo "TLS verify (container $CONTAINER -> $VERIFY_TLS_EP):"
-      if nsenter -t "$LEADER" -m -p -u -n -- bash -c \
-        "echo | openssl s_client -connect '$VERIFY_TLS_EP' -verify_return_error -brief 2>&1 | head -3"; then
-        echo "TLS OK (container)"
-      else
-        echo "ERROR: TLS verification failed inside container $CONTAINER" >&2
-        exit 1
-      fi
+      tls_check "container $CONTAINER" nsenter -t "$LEADER" -m -p -u -n -- || TLS_FAILED=1
     fi
   else
     echo "WARNING: container '$CONTAINER' is not running — skipped" >&2
@@ -345,27 +372,19 @@ fi
 
 # End-to-end TLS check on the host
 if [ -n "$VERIFY_TLS_EP" ]; then
-  echo ""
-  echo "TLS verify (host -> $VERIFY_TLS_EP):"
-  if echo | openssl s_client -connect "$VERIFY_TLS_EP" -verify_return_error -brief 2>&1 | head -3; then
-    echo "TLS OK (host)"
-  else
-    echo "ERROR: TLS verification failed on host" >&2
-    exit 1
-  fi
+  tls_check host || TLS_FAILED=1
 fi
+exit "$TLS_FAILED"
 RSCRIPT
 )"
   root_script="${root_script/__B64_CERT__/$b64_cert}"
   root_script="${root_script/__CONTAINER__/$CONTAINER}"
   root_script="${root_script/__VERIFY_TLS__/$VERIFY_TLS}"
+  root_script="${root_script/__VERIFY__/$VERIFY}"
 
-  run_remote_sudo_script "$host" "$root_script"
-
-  if [[ "$VERIFY" -eq 1 ]]; then
-    info "[$host] verify: best-effort check in /etc/ssl/certs"
-    run_ssh_user "$host" "ls -1 /etc/ssl/certs | grep -i 'company-lab-root-ca' || true"
-  fi
+  # Explicit "|| return 1": callers use "if install_on_node", which disables
+  # set -e inside this function, so a failed install would otherwise count as OK.
+  run_remote_sudo_script "$host" "$root_script" || return 1
 
   info "[$host] done"
 }
