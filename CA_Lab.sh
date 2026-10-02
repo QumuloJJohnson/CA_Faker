@@ -141,9 +141,10 @@ cleanup() {
   QQ_PW=""
   SSH_PW=()
   SUDO_PW=()
-  if [[ -n "$LAB_ABS" && "$DRY_RUN" -eq 0 ]]; then
-    rm -rf "$LAB_ABS/tmp"
-    [[ "$LOCK_HELD" -eq 1 ]] && rm -rf "$LAB_ABS/.lock"
+  # Only the lock holder owns tmp/: another run's tmp/ holds its qq
+  # credential stores and per-host files.
+  if [[ -n "$LAB_ABS" && "$DRY_RUN" -eq 0 && "$LOCK_HELD" -eq 1 ]]; then
+    rm -rf "$LAB_ABS/tmp" "$LAB_ABS/.lock"
   fi
   return 0
 }
@@ -1183,8 +1184,13 @@ remove_lab() {
   fi
   echo
   print_desktop_removal
-  echo "Now delete $LAB_ABS"
-  [[ ${#keep[@]} -eq 0 ]] || exit 2
+  # The rerun needs the lab key and inventory, so only a clean lab may go.
+  if [[ ${#keep[@]} -eq 0 ]]; then
+    echo "Now delete $LAB_ABS"
+  else
+    echo "Keep $LAB_ABS until --remove has cleaned every host (the rerun needs its key and inventory)."
+    exit 2
+  fi
 }
 
 print_desktop_removal() {

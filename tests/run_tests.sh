@@ -169,7 +169,10 @@ test_all_scripts_parse() {
 }
 
 test_shellcheck_errors_if_installed() {
-  command -v shellcheck >/dev/null 2>&1 || return 0
+  if ! command -v shellcheck >/dev/null 2>&1; then
+    skip "shellcheck not installed"
+    return 0
+  fi
   run_cmd shellcheck -S error "$REPO"/*.sh "$REPO"/tests/*.sh
   assert_rc 0
 }
@@ -1193,6 +1196,35 @@ test_lab_no_tty_without_password_env_fails() {
   assert_rc 1
   assert_contains "ERROR: no TTY — set CA_LAB_*_PASSWORD or run interactively"
   [[ ! -d lab/.lock ]] || fail "lock left behind"
+}
+
+# A run that does not hold the lab lock must leave the active run's tmp/
+# (its qq credential stores and per-host files) alone.
+test_lab_run_without_the_lock_keeps_tmp() {
+  make_lab || return 1
+  mkdir -p lab/.lock lab/tmp
+  echo "4242 otherbox" > lab/.lock/owner
+  echo marker > lab/tmp/active.cred
+  printf 'admin@node1\n' > bad_clients.txt
+  run_cmd "$LAB" --clients bad_clients.txt --ssh-user admin --lab-dir ./lab
+  assert_rc 1
+  printf 'h1\tu\tclient\t-\tlab\tAA\t2026-01-01\n' > lab/inventory.txt
+  run_cmd "$LAB" --forget h1 --lab-dir ./lab
+  assert_rc 1
+  assert_file lab/tmp/active.cred
+}
+
+# Hosts that could not be cleaned need the lab folder for the rerun, so
+# --remove must not tell the user to delete it.
+test_lab_remove_with_hosts_left_does_not_say_delete() {
+  command -v ssh >/dev/null 2>&1 || { skip "ssh client not installed"; return 0; }
+  make_lab || return 1
+  printf '127.0.0.1\tu\tclient\t-\tlab\tAA\t2026-01-01\n' > lab/inventory.txt
+  run_cmd env CA_LAB_SUDO_PASSWORD=x "$LAB" --remove --lab-dir ./lab --port 1 --timeout 2
+  assert_rc 2
+  assert_contains "Not removed (rerun --remove"
+  assert_not_contains "Now delete"
+  assert_file lab/inventory.txt
 }
 
 test_lab_held_lock_fails_with_hint() {
