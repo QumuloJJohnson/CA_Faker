@@ -237,7 +237,8 @@ test_pusher_rejects_bad_trust_name() {
 test_pusher_placeholders_appear_once() {
   sed -n "/<<'RSCRIPT'/,/^RSCRIPT$/p" "$PUSHER" > root_script.sh
   local ph n
-  for ph in __B64_CERT__ __CONTAINER__ __VERIFY_TLS__ __VERIFY__ __TRUST_NAME__; do
+  for ph in __B64_CERT__ __CONTAINER__ __VERIFY_TLS__ __VERIFY__ __TRUST_NAME__ \
+      __HOST__ __MODE__ __ROOTS__; do
     n="$(grep -o "$ph" root_script.sh | wc -l | tr -d ' ')"
     assert_eq "$n" 1 "count of $ph"
   done
@@ -837,7 +838,7 @@ test_readme_documents_every_flag() {
       continue
     fi
     n=0
-    for flag in $(grep -oE '^ +--[a-z-]+' <<< "$help" | tr -d ' ' | sort -u); do
+    for flag in $(grep -oE '^ +--[a-z0-9-]+' <<< "$help" | tr -d ' ' | sort -u); do
       n=$((n+1))
       [[ "$flag" == "--help" ]] && continue
       grep -qF -- "\`$flag" "$REPO/README.md" || fail "$script $flag is not in README.md"
@@ -866,6 +867,93 @@ test_repo_mentions_no_internal_tools() {
     run_cmd grep -rniE "$pattern" "$REPO" --exclude-dir=.git
   fi
   assert_rc 1
+}
+
+# Clients files edited on Windows end lines with CR; the host is still valid.
+test_pusher_accepts_crlf_clients_file() {
+  if ! command -v ssh >/dev/null 2>&1 || ! command -v ssh-keygen >/dev/null 2>&1; then
+    skip "ssh client not installed"
+    return 0
+  fi
+  make_plain_ca od
+  printf '127.0.0.1\r\n' > clients.txt
+  ssh-keygen -q -t ed25519 -N "" -f key >/dev/null
+  run_in $'\n' "$PUSHER" --clients clients.txt --ca od --ssh-user u --auth key --key key \
+    --port 1 --timeout 2 --sudo-password-stdin
+  assert_rc 2
+  assert_not_contains "is not a valid host"
+  assert_contains $'Target: 127.0.0.1\n'
+}
+
+test_pusher_rejects_unsafe_host_lines() {
+  make_plain_ca od
+  printf 'good.qumulotest.local\nadmin@node1\nnode;id\n' > clients.txt
+  run_cmd "$PUSHER" --clients clients.txt --ca od --ssh-user u --auth key
+  assert_rc 1
+  assert_contains "ERROR: clients.txt line 2: 'admin@node1' is not a valid host"
+  assert_contains "ERROR: clients.txt line 3: 'node;id' is not a valid host"
+}
+
+test_pusher_checks_every_verify_tls_value() {
+  make_plain_ca od
+  : > clients.txt
+  run_cmd "$PUSHER" --clients clients.txt --ca od \
+    --verify-tls b.qumulotest.local --verify-tls a.qumulotest.local:443
+  assert_rc 1
+  assert_contains "got 'b.qumulotest.local'"
+  run_cmd "$PUSHER" --clients clients.txt --ca od \
+    --verify-tls a.qumulotest.local:443 --verify-tls '[2001:db8::10]:443'
+  assert_contains "ERROR: No hosts found"
+}
+
+test_pusher_ca_accepts_dir_holding_ca_crt() {
+  make_plain_ca od
+  : > clients.txt
+  run_cmd "$PUSHER" --clients clients.txt --ca od/ca
+  assert_contains "ERROR: No hosts found"
+  mkdir empty
+  run_cmd "$PUSHER" --clients clients.txt --ca empty
+  assert_rc 1
+  assert_contains "CA cert not found at expected path: empty/ca/ca.crt.pem (or empty/ca.crt.pem)"
+}
+
+test_pusher_remove_argument_rules() {
+  : > clients.txt
+  local good="0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
+  run_cmd "$PUSHER" --clients clients.txt --remove
+  assert_rc 1
+  assert_contains "ERROR: --remove needs at least one --remove-sha256"
+  local bad
+  for bad in "${good,,}" "${good:0:63}" "01:23" ""; do
+    run_cmd "$PUSHER" --clients clients.txt --remove --remove-sha256 "$bad"
+    assert_rc 1
+    assert_contains "ERROR: --remove-sha256 must be 64 uppercase hex"
+  done
+  run_cmd "$PUSHER" --clients clients.txt --remove-sha256 "$good"
+  assert_rc 1
+  assert_contains "ERROR: --remove-sha256 needs --remove"
+  run_cmd "$PUSHER" --clients clients.txt --remove --remove-sha256 "$good" --verify-tls a.qumulotest.local:443
+  assert_rc 1
+  assert_contains "ERROR: --verify-tls cannot be used with --remove"
+  run_cmd "$PUSHER" --clients clients.txt --remove --remove-sha256 "$good"
+  assert_contains "ERROR: No hosts found"
+}
+
+# With --sudo-password-stdin nothing prompts; an empty password means
+# passwordless sudo, which is probed per host (and fails here: no sshd).
+test_pusher_sudo_password_stdin_reads_without_prompt() {
+  if ! command -v ssh >/dev/null 2>&1 || ! command -v ssh-keygen >/dev/null 2>&1; then
+    skip "ssh client not installed"
+    return 0
+  fi
+  make_plain_ca od
+  echo "127.0.0.1" > clients.txt
+  ssh-keygen -q -t ed25519 -N "" -f key >/dev/null
+  run_in $'\n' "$PUSHER" --clients clients.txt --ca od --ssh-user u --auth key --key key \
+    --port 1 --timeout 2 --sudo-password-stdin
+  assert_rc 2
+  assert_not_contains "Remote sudo password"
+  assert_contains "[127.0.0.1] no sudo password was given and u cannot sudo without one"
 }
 
 run_test() {

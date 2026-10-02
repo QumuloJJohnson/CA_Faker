@@ -14,7 +14,8 @@
   not by name.
 - `certbundle.pem` holds 3 certificates (leaf, intermediate, root).
 - CA_Faker prints the CN/SAN you asked for as "requested"; the values that
-  count are read from the cert in the `READY.` block.
+  count are read from the cert in the `READY.` block. CA_Pusher adds
+  `RESULT ...` lines to stdout (see README); other output is unchanged.
 - Upgrading a running lab: re-apply the new cert to the cluster (README step
   4) BEFORE re-pushing trust (step 3), or nodes reject the old served cert in
   between.
@@ -59,6 +60,22 @@
   `WARNING: replacing a different lab's root on <host>`.
 - The remote root script detaches its stdin first, so the sudo password line
   can never be read by a later command.
+- `--verify-tls` may be given more than once. Every endpoint is checked on the
+  host and in the container; one failure no longer stops the others, and the
+  host fails at the end if any check failed.
+- `RESULT <host> ...` lines on stdout, one per proven fact (README lists the
+  format). `trust` is `NOT-VERIFIED`, never `OK`, with `--no-verify`.
+  Replacing a different root also prints `RESULT <host> trust-replaced <sha256>`.
+- A skipped container is shown on the host's `done` line and in the summary
+  (`Container skipped on:`).
+- `--sudo-password-stdin` reads the sudo password from stdin. An empty sudo
+  password now means passwordless sudo (checked per host with `sudo -n true`).
+- `--ca` also accepts a directory holding `ca.crt.pem` itself.
+- Hosts in the clients file may contain only letters, digits, `.`, `_`, `:`
+  and `-`; other lines are an `ERROR:` before anything is pushed.
+- New `--remove --remove-sha256 <hex> [...]`: removes those roots from every
+  host (and `--container`) and proves the refreshed bundle no longer holds
+  them.
 - `--verify-tls` checks the hostname (or IP) as well as the chain, on the
   host and in the container (`-verify_hostname` / `-verify_ip`; SNI is sent
   for names). The value must be `host:port`, IPv6 in brackets

@@ -9,10 +9,11 @@
 #                        (i.e. the same --out-dir you used there, e.g. /root/qumulo-tls)
 #
 # This script:
-#   1) pulls the CA cert from: <dir>/ca/ca.crt.pem
+#   1) pulls the CA cert from: <dir>/ca/ca.crt.pem (or <dir>/ca.crt.pem)
 #   2) prompts for SSH username
 #   3) prompts for SSH auth method (key or password)
-#   4) prompts for the remote sudo password (user is NOT passwordless sudoer)
+#   4) prompts for the remote sudo password (or reads it from stdin with
+#      --sudo-password-stdin; empty = passwordless sudo, checked per host)
 #   5) copies the CA cert to each client
 #   6) installs it into the system trust store: Ubuntu/Debian
 #      (/usr/local/share/ca-certificates, update-ca-certificates) or
@@ -31,6 +32,20 @@
 #
 # Clients file format:
 #   One host/IP/FQDN per line. Blank lines and lines starting with # are ignored.
+#   Hosts may contain only letters, digits, '.', '_', ':' and '-'.
+#
+# Machine-readable results (stable interface; one line per fact on stdout):
+#   RESULT <host> trust OK|FAILED|NOT-VERIFIED
+#   RESULT <host> trust-replaced <old-sha256>          (informational)
+#   RESULT <host> container <name> OK|SKIPPED|FAILED|NOT-VERIFIED
+#   RESULT <host> tls host <host:port> OK|FAILED
+#   RESULT <host> tls container <name> <host:port> OK|FAILED
+# With --remove:
+#   RESULT <host> trust REMOVED|FAILED
+#   RESULT <host> container <name> trust REMOVED|FAILED
+# <host> is the line from the clients file. A missing line means not proven.
+#
+# Exit codes: 0 every host done, 1 bad arguments or input, 2 a host failed.
 #
 # Security notes:
 # - The sudo password is read from stdin (hidden) and held only in memory.
@@ -62,22 +77,29 @@ AUTH_MODE=""          # "key" or "password"
 SSH_KEY_PATH=""       # used if AUTH_MODE=key (optional)
 VERIFY=1
 CONTAINER=""          # systemd-nspawn container name (e.g. "qcore")
-VERIFY_TLS=""         # optional host:port for end-to-end TLS check
+VERIFY_TLS=""         # space-separated host:port list for end-to-end TLS checks
+VERIFY_TLS_LIST=()
+REMOVE=0
+REMOVE_ROOTS=()       # normalised SHA-256 fingerprints for --remove
+SUDO_STDIN=0
+CONTAINER_SKIPPED=()
 TRUST_NAME="company-lab-root-ca"   # trust file name on targets (.crt is appended)
 CONNECT_TIMEOUT=8
 
 # In-memory secrets
 SSHPASS=""            # only if AUTH_MODE=password (sshpass)
-SUDO_PASS=""          # always required (remote sudo password)
+SUDO_PASS=""          # remote sudo password; empty = passwordless sudo
 
 usage() {
   cat <<EOF
 Usage: $0 --clients <file> --ca <ca-tool-out-dir> [options]
+       $0 --clients <file> --remove --remove-sha256 <hex> [--remove-sha256 <hex> ...] [options]
 
 Required:
   --clients <file>        File with one client IP/hostname/FQDN per line
   --ca <dir>              Directory created by CA creation tool (e.g. /root/qumulo-tls)
                           CA cert is expected at: <dir>/ca/ca.crt.pem
+                          (or <dir>/ca.crt.pem, e.g. a CA_Faker --ca-dir)
 
 Optional:
   --ssh-user <name>           SSH username (if omitted, will prompt)
@@ -93,13 +115,22 @@ Optional:
   --verify-tls <h:p>     End-to-end TLS check against host:port after install,
                           from the host and the container. The chain AND the
                           name (or IP) are checked. The port is required; put
-                          IPv6 in brackets.
+                          IPv6 in brackets. May be given more than once; every
+                          endpoint is checked.
                           (e.g. --verify-tls stratusdatacore.qumulotest.local:443
                            or --verify-tls [2001:db8::10]:443)
   --no-verify             Skip the check that the refreshed trust store
                           contains the CA (host and container)
   --trust-name <name>     Trust file name on targets, without .crt
                           (default: $TRUST_NAME)
+  --sudo-password-stdin   Read the sudo password from the first line of stdin
+                          (no prompt). Empty means passwordless sudo.
+  --remove                Remove lab roots instead of installing: every single-
+                          cert file in the trust store holding a listed root is
+                          deleted, then the refreshed bundle is proven free of
+                          them (host and --container)
+  --remove-sha256 <hex>   Root to remove (SHA-256, 64 uppercase hex, no colons);
+                          repeatable; required with --remove
   --timeout <sec>         SSH connect timeout (default: $CONNECT_TIMEOUT)
   --version               Show version
   --help                  Show help
@@ -238,9 +269,12 @@ parse_args() {
       --auth) AUTH_MODE="${2:-}"; shift 2 ;;
       --key) SSH_KEY_PATH="${2:-}"; shift 2 ;;
       --container) CONTAINER="${2:-}"; shift 2 ;;
-      --verify-tls) VERIFY_TLS="${2:-}"; shift 2 ;;
+      --verify-tls) VERIFY_TLS_LIST+=("${2:-}"); shift 2 ;;
       --no-verify) VERIFY=0; shift 1 ;;
       --trust-name) TRUST_NAME="${2:-}"; shift 2 ;;
+      --sudo-password-stdin) SUDO_STDIN=1; shift 1 ;;
+      --remove) REMOVE=1; shift 1 ;;
+      --remove-sha256) REMOVE_ROOTS+=("${2:-}"); shift 2 ;;
       --timeout) CONNECT_TIMEOUT="${2:-}"; shift 2 ;;
       --version) echo "$(basename "$0") $VERSION"; exit 0 ;;
       --help|-h) usage; exit 0 ;;
@@ -252,19 +286,40 @@ parse_args() {
     err "--clients file is required and must exist"; exit 1
   fi
 
-  if [[ -z "$CA_DIR" || ! -d "$CA_DIR" ]]; then
-    err "--ca must point to the CA tool output directory and must exist"; exit 1
+  local root
+  if [[ "$REMOVE" -eq 1 ]]; then
+    if [[ ${#REMOVE_ROOTS[@]} -eq 0 ]]; then
+      err "--remove needs at least one --remove-sha256 <hex>"; exit 1
+    fi
+    for root in "${REMOVE_ROOTS[@]}"; do
+      if ! [[ "$root" =~ ^[0-9A-F]{64}$ ]]; then
+        err "--remove-sha256 must be 64 uppercase hex characters without colons; got '$root'"; exit 1
+      fi
+    done
+    if [[ ${#VERIFY_TLS_LIST[@]} -gt 0 ]]; then
+      err "--verify-tls cannot be used with --remove"; exit 1
+    fi
+  elif [[ ${#REMOVE_ROOTS[@]} -gt 0 ]]; then
+    err "--remove-sha256 needs --remove"; exit 1
   fi
 
-  CA_CERT="${CA_DIR%/}/ca/ca.crt.pem"
-  if [[ ! -f "$CA_CERT" ]]; then
-    err "CA cert not found at expected path: $CA_CERT"
-    err "Ensure --ca points to the same --out-dir used by the CA creation tool."
-    exit 1
-  fi
+  if [[ "$REMOVE" -eq 0 ]]; then
+    if [[ -z "$CA_DIR" || ! -d "$CA_DIR" ]]; then
+      err "--ca must point to the CA tool output directory and must exist"; exit 1
+    fi
 
-  if ! openssl x509 -in "$CA_CERT" -noout >/dev/null 2>&1; then
-    err "CA file does not look like a valid PEM X.509 cert: $CA_CERT"; exit 1
+    # Today's out-dir layout first, then a directory holding ca.crt.pem itself.
+    CA_CERT="${CA_DIR%/}/ca/ca.crt.pem"
+    [[ -f "$CA_CERT" ]] || CA_CERT="${CA_DIR%/}/ca.crt.pem"
+    if [[ ! -f "$CA_CERT" ]]; then
+      err "CA cert not found at expected path: ${CA_DIR%/}/ca/ca.crt.pem (or ${CA_DIR%/}/ca.crt.pem)"
+      err "Ensure --ca points to the same --out-dir used by the CA creation tool."
+      exit 1
+    fi
+
+    if ! openssl x509 -in "$CA_CERT" -noout >/dev/null 2>&1; then
+      err "CA file does not look like a valid PEM X.509 cert: $CA_CERT"; exit 1
+    fi
   fi
 
   if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || [[ "$SSH_PORT" -lt 1 || "$SSH_PORT" -gt 65535 ]]; then
@@ -286,20 +341,31 @@ parse_args() {
   if ! [[ "$TRUST_NAME" =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*$ ]]; then
     err "--trust-name must start with a letter, digit, '_' or '-' and contain only those and '.'"; exit 1
   fi
-  if [[ -n "$VERIFY_TLS" ]]; then
-    check_verify_tls "$VERIFY_TLS"
-  fi
+  local ep
+  for ep in ${VERIFY_TLS_LIST[@]+"${VERIFY_TLS_LIST[@]}"}; do
+    check_verify_tls "$ep"
+  done
+  # Safe to join with spaces: every endpoint is a validated host:port.
+  VERIFY_TLS="${VERIFY_TLS_LIST[*]+${VERIFY_TLS_LIST[*]}}"
 }
 
 # Read the clients file up front so an empty file fails before any prompt.
+# Hosts are spliced into the root script, so only plain names are allowed.
 load_hosts() {
-  local line
+  local line n=0 bad=0
   HOSTS=()
   while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n+1))
     line="$(echo "$line" | sed -e 's/#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     [[ -z "$line" ]] && continue
+    if ! [[ "$line" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+      err "$CLIENTS_FILE line $n: '$line' is not a valid host (letters, digits, '.', '_', ':' and '-' only)"
+      bad=1
+      continue
+    fi
     HOSTS+=("$line")
   done < "$CLIENTS_FILE"
+  [[ "$bad" -eq 0 ]] || exit 1
   if [[ ${#HOSTS[@]} -eq 0 ]]; then
     err "No hosts found in $CLIENTS_FILE"; exit 1
   fi
@@ -341,11 +407,12 @@ prompt_creds() {
       ;;
   esac
 
-  # Always required because user is NOT passwordless sudoer
-  read -r -e -s -p "Remote sudo password for ${SSH_USER}: " SUDO_PASS
-  echo
-  if [[ -z "$SUDO_PASS" ]]; then
-    err "Remote sudo password cannot be empty"; exit 1
+  # Empty is allowed: each host is then checked for passwordless sudo.
+  if [[ "$SUDO_STDIN" -eq 1 ]]; then
+    IFS= read -r SUDO_PASS || true
+  else
+    read -r -e -s -p "Remote sudo password for ${SSH_USER} (empty for passwordless sudo): " SUDO_PASS
+    echo
   fi
 }
 
@@ -407,11 +474,20 @@ run_remote_sudo_script() {
   #   2. decode the base64 payload into a temp script
   #   3. run the temp script under sudo -S (password piped in)
   #   4. clean up and propagate the exit code
+  local sudo_cmd="sudo -S"
+  if [[ -z "$SUDO_PASS" ]]; then
+    if ! run_ssh_no_tty "$host" "sudo -n true" </dev/null; then
+      err "[$host] no sudo password was given and ${SSH_USER} cannot sudo without one"
+      return 1
+    fi
+    sudo_cmd="sudo -n"
+  fi
+
   local remote_cmd
   remote_cmd="read -r _PW \
 && _S=\$(mktemp) \
 && echo '${b64_script}' | base64 -d > \"\$_S\" \
-&& printf '%s\\n' \"\$_PW\" | sudo -S bash \"\$_S\"; \
+&& printf '%s\\n' \"\$_PW\" | ${sudo_cmd} bash \"\$_S\"; \
 _rc=\$?; rm -f \"\$_S\"; exit \$_rc"
 
   # Pipe the sudo password as stdin; use no-TTY ssh to prevent interactive shell
@@ -421,25 +497,59 @@ _rc=\$?; rm -f \"\$_S\"; exit \$_rc"
 install_on_node() {
   local host="$1"
 
-  info "[$host] installing CA into system trust store (sudo required)"
+  if [[ "$REMOVE" -eq 1 ]]; then
+    info "[$host] removing lab roots from the system trust store (sudo required)"
+  else
+    info "[$host] installing CA into system trust store (sudo required)"
+  fi
 
   # Embed the CA cert directly in the payload — avoids SCP and the
   # temp-file permission issue (previous runs leave root-owned files in /tmp).
-  local b64_cert
-  b64_cert="$(base64 < "$CA_CERT" | tr -d '\n')" || return 1
+  local b64_cert=""
+  if [[ "$REMOVE" -eq 0 ]]; then
+    b64_cert="$(base64 < "$CA_CERT" | tr -d '\n')" || return 1
+  fi
 
   local root_script
   root_script="$(cat <<'RSCRIPT'
 exec </dev/null
 set -euo pipefail
+MODE="__MODE__"
+HOST="__HOST__"
 CONTAINER="__CONTAINER__"
-VERIFY_TLS_EP="__VERIFY_TLS__"
+VERIFY_TLS_EPS="__VERIFY_TLS__"
 VERIFY_TRUST="__VERIFY__"
 TRUST_NAME="__TRUST_NAME__"
+REMOVE_ROOTS="__ROOTS__"
+ANY_FAIL=0
 
 # Normalised SHA-256 of a PEM cert; empty when the file is not a readable cert.
 fp_of() {
   openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 | tr -d : | tr a-f A-F || true
+}
+
+# Detect this machine's trust store tools; sets TS_DIR, TS_REFRESH, TS_BUNDLE.
+# update-ca-certificates is checked first so Ubuntu hosts behave as before.
+trust_family() {
+  local label="$1"
+  if command -v update-ca-certificates >/dev/null 2>&1; then
+    echo "$label: Ubuntu-family (update-ca-certificates)"
+    TS_DIR="/usr/local/share/ca-certificates"
+    TS_REFRESH="update-ca-certificates"
+    TS_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
+  elif command -v update-ca-trust >/dev/null 2>&1; then
+    echo "$label: RHEL-family (update-ca-trust)"
+    TS_DIR="/etc/pki/ca-trust/source/anchors"
+    TS_REFRESH="update-ca-trust extract"
+    TS_BUNDLE="/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+  else
+    echo "ERROR: No supported trust store tool found (need update-ca-certificates or update-ca-trust)" >&2
+    return 1
+  fi
+  if ! command -v openssl >/dev/null 2>&1; then
+    echo "ERROR: openssl not found on $2; install it (apt/dnf install openssl)" >&2
+    return 1
+  fi
 }
 
 # Install the lab root (PEM on stdin) into this machine's trust store and,
@@ -448,26 +558,10 @@ fp_of() {
 # its own tools and paths. Callers run it in an `if`, where set -e does not
 # apply, so every step returns on failure.
 trust_install() {
-  local label="$1" where="$2" name="$3" verify="$4"
-  local dst refresh bundle tmp new_fp old_fp
-  if command -v update-ca-certificates >/dev/null 2>&1; then
-    echo "$label: Ubuntu-family (update-ca-certificates)"
-    dst="/usr/local/share/ca-certificates/$name.crt"
-    refresh="update-ca-certificates"
-    bundle="/etc/ssl/certs/ca-certificates.crt"
-  elif command -v update-ca-trust >/dev/null 2>&1; then
-    echo "$label: RHEL-family (update-ca-trust)"
-    dst="/etc/pki/ca-trust/source/anchors/$name.crt"
-    refresh="update-ca-trust extract"
-    bundle="/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
-  else
-    echo "ERROR: No supported trust store tool found (need update-ca-certificates or update-ca-trust)" >&2
-    return 1
-  fi
-  if ! command -v openssl >/dev/null 2>&1; then
-    echo "ERROR: openssl not found on $where; install it (apt/dnf install openssl)" >&2
-    return 1
-  fi
+  local label="$1" where="$2" name="$3" verify="$4" replaced_line="$5"
+  local dst tmp new_fp old_fp
+  trust_family "$label" "$where" || return 1
+  dst="$TS_DIR/$name.crt"
   tmp="$(mktemp)" || return 1
   cat > "$tmp" || { rm -f "$tmp"; return 1; }
   new_fp="$(fp_of "$tmp")"
@@ -478,23 +572,95 @@ trust_install() {
     old_fp="$(fp_of "$dst")"
     if [ "$old_fp" != "$new_fp" ]; then
       echo "WARNING: replacing a different lab's root on $where ($dst)" >&2
+      if [ -n "$replaced_line" ]; then
+        echo "$replaced_line ${old_fp:-unreadable}"
+      fi
     fi
   fi
   cat "$tmp" > "$dst" || { rm -f "$tmp"; return 1; }
   rm -f "$tmp"
   chmod 0644 "$dst" || return 1
-  $refresh >/dev/null || { echo "ERROR: $refresh failed on $where" >&2; return 1; }
+  $TS_REFRESH >/dev/null || { echo "ERROR: $TS_REFRESH failed on $where" >&2; return 1; }
   echo "Installed: $dst"
   openssl x509 -in "$dst" -noout -subject -fingerprint -sha256 || return 1
   if [ "$verify" = 1 ]; then
     # -trusted, not -CAfile: -CAfile also consults the default CA path, so it
     # can pass for a cert that is not in the bundle.
-    if ! openssl verify -trusted "$bundle" "$dst" >/dev/null 2>&1; then
-      echo "ERROR: lab root not found in $bundle on $where after $refresh" >&2
+    if ! openssl verify -trusted "$TS_BUNDLE" "$dst" >/dev/null 2>&1; then
+      echo "ERROR: lab root not found in $TS_BUNDLE on $where after $TS_REFRESH" >&2
       return 1
     fi
-    echo "Verified: lab root is in $bundle"
+    echo "Verified: lab root is in $TS_BUNDLE"
   fi
+}
+
+# Delete every single-cert anchor file holding one of the listed roots, then
+# prove the refreshed system bundle parses and holds none of them. A failing
+# `openssl verify` is not proof (an empty bundle or an expired root fail it
+# too), so every cert in the bundle is fingerprinted instead.
+trust_remove() {
+  local label="$1" where="$2" roots="$3"
+  local refresh f n fp c chunks hit total=0 bad=0
+  trust_family "$label" "$where" || return 1
+  refresh="$TS_REFRESH"
+  [ "$refresh" = "update-ca-certificates" ] && refresh="update-ca-certificates --fresh"
+  # dotglob: hidden anchor files must be scanned too, like find -type f.
+  shopt -s globstar nullglob dotglob
+  for f in "$TS_DIR"/**; do
+    [ -f "$f" ] || continue
+    n="$(grep -c 'BEGIN CERTIFICATE' "$f" 2>/dev/null || true)"
+    [ "${n:-0}" -ge 1 ] || continue
+    if [ "$n" -eq 1 ]; then
+      fp="$(fp_of "$f")"
+      [ -n "$fp" ] || continue
+      case " $roots " in
+        *" $fp "*) rm -f "$f" || return 1; echo "Removed: $f" ;;
+      esac
+    else
+      # Never edit a multi-cert file: name it and fail.
+      chunks="$(mktemp -d)" || return 1
+      awk -v d="$chunks" '/-----BEGIN CERTIFICATE-----/{n++; f=d"/c"n".pem"} f{print > f} /-----END CERTIFICATE-----/{close(f); f=""}' "$f"
+      hit=0
+      for c in "$chunks"/c*.pem; do
+        fp="$(fp_of "$c")"
+        case " $roots " in *" $fp "*) [ -n "$fp" ] && hit=1 ;; esac
+      done
+      rm -rf "$chunks"
+      if [ "$hit" -eq 1 ]; then
+        echo "ERROR: $f holds several certificates, one of them a lab root; not edited — remove that cert by hand" >&2
+        bad=1
+      fi
+    fi
+  done
+  $refresh >/dev/null || { echo "ERROR: $refresh failed on $where" >&2; return 1; }
+  if [ ! -s "$TS_BUNDLE" ]; then
+    echo "ERROR: $TS_BUNDLE is missing or empty on $where" >&2
+    return 1
+  fi
+  chunks="$(mktemp -d)" || return 1
+  if ! awk -v d="$chunks" '/-----BEGIN CERTIFICATE-----/{n++; f=d"/c"n".pem"} f{print > f} /-----END CERTIFICATE-----/{close(f); f=""}' "$TS_BUNDLE"; then
+    rm -rf "$chunks"; return 1
+  fi
+  for c in "$chunks"/c*.pem; do
+    total=$((total+1))
+    if ! fp="$(openssl x509 -in "$c" -noout -fingerprint -sha256 2>/dev/null)"; then
+      echo "ERROR: a certificate in $TS_BUNDLE on $where cannot be read" >&2
+      bad=1; continue
+    fi
+    fp="$(printf '%s\n' "$fp" | cut -d= -f2 | tr -d : | tr a-f A-F)"
+    if [ -z "$fp" ]; then
+      bad=1; continue
+    fi
+    case " $roots " in
+      *" $fp "*) echo "ERROR: lab root $fp is still in $TS_BUNDLE on $where" >&2; bad=1 ;;
+    esac
+  done
+  rm -rf "$chunks"
+  if [ "$total" -lt 1 ]; then
+    echo "ERROR: no certificates found in $TS_BUNDLE on $where" >&2
+    bad=1
+  fi
+  [ "$bad" -eq 0 ]
 }
 
 # Validate a TLS endpoint with this machine's default trust store, checking
@@ -517,11 +683,54 @@ tls_check() {
   return 1
 }
 
+# Prints the container leader PID, or nothing (with a WARNING naming the
+# cause) when the container cannot be used.
+container_leader() {
+  if ! command -v machinectl >/dev/null 2>&1; then
+    echo "WARNING: container '$CONTAINER' skipped: machinectl not found (install systemd-container)" >&2
+    return 1
+  fi
+  if ! machinectl status "$CONTAINER" >/dev/null 2>&1; then
+    echo "WARNING: container '$CONTAINER' is not running — skipped" >&2
+    return 1
+  fi
+  machinectl show "$CONTAINER" -p Leader --value
+}
+
+if [ "$MODE" = "remove" ]; then
+  if trust_remove "Trust store" "$HOST" "$REMOVE_ROOTS"; then
+    echo "RESULT $HOST trust REMOVED"
+  else
+    echo "RESULT $HOST trust FAILED"; ANY_FAIL=1
+  fi
+  if [ -n "$CONTAINER" ]; then
+    echo ""
+    echo "Removing lab roots from nspawn container: $CONTAINER"
+    if LEADER="$(container_leader)" && [ -n "$LEADER" ] \
+        && nsenter -t "$LEADER" -m -p -u -- bash -c "$(declare -f fp_of trust_family trust_remove); trust_remove \"\$@\"" _ \
+          "Container $CONTAINER trust store" "container $CONTAINER" "$REMOVE_ROOTS"; then
+      echo "RESULT $HOST container $CONTAINER trust REMOVED"
+    else
+      echo "ERROR: lab roots could not be removed from container $CONTAINER (if it is not running: start it and rerun)" >&2
+      echo "RESULT $HOST container $CONTAINER trust FAILED"; ANY_FAIL=1
+    fi
+  fi
+  [ "$ANY_FAIL" -eq 0 ] || exit 1
+  exit 0
+fi
+
 CERT="$(mktemp)"
 trap 'rm -f "$CERT"' EXIT
 echo '__B64_CERT__' | base64 -d > "$CERT"
 
-if ! trust_install "Trust store" "host" "$TRUST_NAME" "$VERIFY_TRUST" < "$CERT"; then
+if trust_install "Trust store" "$HOST" "$TRUST_NAME" "$VERIFY_TRUST" "RESULT $HOST trust-replaced" < "$CERT"; then
+  if [ "$VERIFY_TRUST" = 1 ]; then
+    echo "RESULT $HOST trust OK"
+  else
+    echo "RESULT $HOST trust NOT-VERIFIED"
+  fi
+else
+  echo "RESULT $HOST trust FAILED"
   exit 1
 fi
 
@@ -529,48 +738,54 @@ fi
 rm -f /tmp/company-lab-root-ca.crt
 
 # Install into systemd-nspawn container if requested
+CSTATE=""
+LEADER=""
 if [ -n "$CONTAINER" ]; then
   echo ""
   echo "Installing CA cert into nspawn container: $CONTAINER"
-  if ! command -v machinectl >/dev/null 2>&1; then
-    echo "WARNING: container '$CONTAINER' skipped: machinectl not found (install systemd-container)" >&2
-  elif ! machinectl status "$CONTAINER" >/dev/null 2>&1; then
-    echo "WARNING: container '$CONTAINER' is not running — skipped" >&2
+  if ! LEADER="$(container_leader)" || [ -z "$LEADER" ]; then
+    CSTATE="SKIPPED"
+  elif nsenter -t "$LEADER" -m -p -u -- bash -c "$(declare -f fp_of trust_family trust_install); trust_install \"\$@\"" _ \
+      "Container $CONTAINER trust store" "container $CONTAINER" "$TRUST_NAME" "$VERIFY_TRUST" "" < "$CERT"; then
+    if [ "$VERIFY_TRUST" = 1 ]; then CSTATE="OK"; else CSTATE="NOT-VERIFIED"; fi
   else
-    LEADER=$(machinectl show "$CONTAINER" -p Leader --value)
-
-    # Same function, run inside the container's namespaces with its own tools.
-    if ! nsenter -t "$LEADER" -m -p -u -- bash -c "$(declare -f fp_of trust_install); trust_install \"\$@\"" _ \
-        "Container $CONTAINER trust store" "container $CONTAINER" "$TRUST_NAME" "$VERIFY_TRUST" < "$CERT"; then
-      echo "ERROR: CA cert could not be installed in container $CONTAINER" >&2
-      exit 1
-    fi
-
-    # End-to-end TLS check inside the container
-    if [ -n "$VERIFY_TLS_EP" ]; then
-      echo ""
-      echo "TLS verify (container $CONTAINER -> $VERIFY_TLS_EP):"
-      if nsenter -t "$LEADER" -m -p -u -n -- bash -c "$(declare -f tls_check); tls_check \"\$1\"" _ "$VERIFY_TLS_EP"; then
-        echo "TLS OK (container $CONTAINER): chain and name validated for $VERIFY_TLS_EP"
-      else
-        echo "ERROR: trust store installed OK, but TLS endpoint $VERIFY_TLS_EP did not validate in container $CONTAINER (expected if the cert has not been applied to the cluster yet — README step 4)" >&2
-        exit 1
-      fi
-    fi
+    echo "ERROR: CA cert could not be installed in container $CONTAINER" >&2
+    CSTATE="FAILED"; ANY_FAIL=1
   fi
+  echo "RESULT $HOST container $CONTAINER $CSTATE"
 fi
 
-# End-to-end TLS check on the host
-if [ -n "$VERIFY_TLS_EP" ]; then
+# Endpoints are validated host:port values; -f stops '[v6]' being globbed.
+set -f
+for EP in $VERIFY_TLS_EPS; do
+  [ "$CSTATE" = "OK" ] || [ "$CSTATE" = "NOT-VERIFIED" ] || continue
   echo ""
-  echo "TLS verify (host -> $VERIFY_TLS_EP):"
-  if tls_check "$VERIFY_TLS_EP"; then
-    echo "TLS OK (host): chain and name validated for $VERIFY_TLS_EP"
+  echo "TLS verify (container $CONTAINER -> $EP):"
+  if nsenter -t "$LEADER" -m -p -u -n -- bash -c "$(declare -f tls_check); tls_check \"\$1\"" _ "$EP"; then
+    echo "TLS OK (container $CONTAINER): chain and name validated for $EP"
+    echo "RESULT $HOST tls container $CONTAINER $EP OK"
   else
-    echo "ERROR: trust store installed OK, but TLS endpoint $VERIFY_TLS_EP did not validate (expected if the cert has not been applied to the cluster yet — README step 4)" >&2
-    exit 1
+    echo "ERROR: trust store installed OK, but TLS endpoint $EP did not validate in container $CONTAINER (expected if the cert has not been applied to the cluster yet — README step 4)" >&2
+    echo "RESULT $HOST tls container $CONTAINER $EP FAILED"
+    ANY_FAIL=1
   fi
-fi
+done
+
+for EP in $VERIFY_TLS_EPS; do
+  echo ""
+  echo "TLS verify (host -> $EP):"
+  if tls_check "$EP"; then
+    echo "TLS OK (host): chain and name validated for $EP"
+    echo "RESULT $HOST tls host $EP OK"
+  else
+    echo "ERROR: trust store installed OK, but TLS endpoint $EP did not validate (expected if the cert has not been applied to the cluster yet — README step 4)" >&2
+    echo "RESULT $HOST tls host $EP FAILED"
+    ANY_FAIL=1
+  fi
+done
+set +f
+
+[ "$ANY_FAIL" -eq 0 ] || exit 1
 RSCRIPT
 )" || return 1
   root_script="${root_script/__B64_CERT__/$b64_cert}"
@@ -578,14 +793,32 @@ RSCRIPT
   root_script="${root_script/__VERIFY_TLS__/$VERIFY_TLS}"
   root_script="${root_script/__VERIFY__/$VERIFY}"
   root_script="${root_script/__TRUST_NAME__/$TRUST_NAME}"
-
-  run_remote_sudo_script "$host" "$root_script" || return 1
-
-  if [[ "$VERIFY" -eq 1 ]]; then
-    info "[$host] done"
+  root_script="${root_script/__HOST__/$host}"
+  if [[ "$REMOVE" -eq 1 ]]; then
+    root_script="${root_script/__MODE__/remove}"
   else
-    info "[$host] done (trust store NOT verified: --no-verify)"
+    root_script="${root_script/__MODE__/install}"
   fi
+  root_script="${root_script/__ROOTS__/${REMOVE_ROOTS[*]+${REMOVE_ROOTS[*]}}}"
+
+  # Keep a copy of the remote output to read this host's RESULT lines.
+  local out_file
+  out_file="$(mktemp)" || return 1
+  if ! run_remote_sudo_script "$host" "$root_script" | tee "$out_file"; then
+    rm -f "$out_file"
+    return 1
+  fi
+
+  local notes=""
+  if [[ "$REMOVE" -eq 0 && "$VERIFY" -eq 0 ]]; then
+    notes+=" (trust store NOT verified: --no-verify)"
+  fi
+  if [[ -n "$CONTAINER" ]] && grep -qFx "RESULT $host container $CONTAINER SKIPPED" "$out_file"; then
+    notes+=" (container $CONTAINER SKIPPED)"
+    CONTAINER_SKIPPED+=("$host")
+  fi
+  rm -f "$out_file"
+  info "[$host] done$notes"
 }
 
 main() {
@@ -598,7 +831,8 @@ main() {
   prompt_creds
 
   info "CA tool output dir: $CA_DIR"
-  info "Resolved CA cert:   $CA_CERT"
+  [[ "$REMOVE" -eq 1 ]] && info "Mode:               remove ${#REMOVE_ROOTS[@]} lab root(s)"
+  [[ "$REMOVE" -eq 0 ]] && info "Resolved CA cert:   $CA_CERT"
   info "Clients file:       $CLIENTS_FILE"
   info "SSH user:           $SSH_USER"
   info "SSH port:           $SSH_PORT"
@@ -634,8 +868,11 @@ main() {
   echo "Total: $total"
   echo "OK:    $ok"
   echo "Fail:  $fail"
-  if [[ "$VERIFY" -eq 0 ]]; then
+  if [[ "$REMOVE" -eq 0 && "$VERIFY" -eq 0 ]]; then
     echo "Note: --no-verify was set; trust stores were not verified."
+  fi
+  if [[ ${#CONTAINER_SKIPPED[@]} -gt 0 ]]; then
+    echo "Container skipped on: ${CONTAINER_SKIPPED[*]}"
   fi
   if [[ "$fail" -gt 0 ]]; then
     echo

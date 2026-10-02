@@ -224,15 +224,18 @@ with `--force-reissue` and re-apply and re-push.
 | Flag | Description |
 |------|-------------|
 | `--clients <file>` | **(required)** File with target hostnames/IPs |
-| `--ca <dir>` | **(required)** Output directory from CA_Faker.sh (a server's out-dir, not the `--ca-dir`) |
+| `--ca <dir>` | **(required)** Output directory from CA_Faker.sh (a server's out-dir; a dir holding `ca.crt.pem` itself, such as a `--ca-dir`, also works) |
 | `--ssh-user <name>` | SSH username (prompts if omitted) |
 | `--auth key\|password` | SSH auth method (prompts if omitted; `password` requires sshpass) |
 | `--key <path>` | SSH private key path |
 | `--port <n>` | SSH port (default: 22) |
 | `--container <name>` | Also install cert into a systemd-nspawn container on each host |
-| `--verify-tls <host:port>` | End-to-end TLS check from host and container after install; checks the chain AND the name or IP (port required, IPv6 as `[addr]:port`) |
+| `--verify-tls <host:port>` | End-to-end TLS check from host and container after install; checks the chain AND the name or IP (port required, IPv6 as `[addr]:port`); repeatable, every endpoint is checked |
 | `--no-verify` | Skip the check that the refreshed trust store contains the CA |
 | `--trust-name <name>` | Trust file name on targets, without `.crt` (default: `company-lab-root-ca`) |
+| `--sudo-password-stdin` | Read the sudo password from the first line of stdin instead of prompting |
+| `--remove` | Remove lab roots instead of installing (host and `--container`); needs `--remove-sha256` |
+| `--remove-sha256 <hex>` | SHA-256 of a root to remove (64 uppercase hex, no colons); repeatable |
 | `--timeout <sec>` | SSH connect timeout (default: 8) |
 | `--version` | Show version |
 
@@ -242,7 +245,36 @@ different lab's root under the same name replaces it, with a WARNING. Use
 `--trust-name` per lab to keep several labs side by side.
 
 A container that is not usable (no `machinectl`, or not running) gets a
-WARNING naming the cause and is skipped; the host still counts as OK.
+WARNING naming the cause and is skipped; the host still counts as OK, its
+`done` line says `(container <name> SKIPPED)` and the summary lists it under
+`Container skipped on:`.
+
+An empty sudo password means passwordless sudo: each host is checked with
+`sudo -n true` and fails if it needs a password.
+
+`--remove` deletes, on each host and in the container, every single-cert file
+in the trust store directory that holds one of the listed roots (any file
+name), refreshes the store, and then proves that no listed root is left in the
+system bundle. A file holding several certs is never edited: it is named and
+the host fails. Get a root's value with:
+`openssl x509 -in ca/ca.crt.pem -noout -fingerprint -sha256 | cut -d= -f2 | tr -d :`
+
+Results for scripts: besides its normal output, CA_Pusher prints one line per
+proven fact on stdout. This format is stable:
+
+```
+RESULT <host> trust OK|FAILED|NOT-VERIFIED
+RESULT <host> trust-replaced <old-sha256>
+RESULT <host> container <name> OK|SKIPPED|FAILED|NOT-VERIFIED
+RESULT <host> tls host <host:port> OK|FAILED
+RESULT <host> tls container <name> <host:port> OK|FAILED
+RESULT <host> trust REMOVED|FAILED                  (--remove)
+RESULT <host> container <name> trust REMOVED|FAILED (--remove)
+```
+
+`<host>` is the line from the clients file. Count a fact only from its `OK`
+(or `REMOVED`) line; a missing line means it was not proven. `trust-replaced`
+is informational (a different root was overwritten).
 
 ## Exit Codes
 
