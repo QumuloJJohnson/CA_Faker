@@ -828,6 +828,46 @@ test_faker_old_root_in_ca_dir_is_refused_unless_key_missing() {
   [[ "$(openssl x509 -in lab/ca.crt.pem -noout -text)" == *"X509v3 Key Usage"* ]] || fail "root was not rebuilt"
 }
 
+# Every flag in a script's --help must be documented in its README table.
+test_readme_documents_every_flag() {
+  local script flag help n
+  for script in CA_Faker.sh CA_Pusher.sh; do
+    if ! help="$("$REPO/$script" --help 2>&1)"; then
+      fail "$script --help failed"
+      continue
+    fi
+    n=0
+    for flag in $(grep -oE '^ +--[a-z-]+' <<< "$help" | tr -d ' ' | sort -u); do
+      n=$((n+1))
+      [[ "$flag" == "--help" ]] && continue
+      grep -qF -- "\`$flag" "$REPO/README.md" || fail "$script $flag is not in README.md"
+    done
+    [[ "$n" -ge 2 ]] || fail "no flags found in $script --help"
+  done
+}
+
+test_ready_points_desktops_to_readme_step_5() {
+  faker_outdir od || return 1
+  run_cmd "$FAKER" --cn stratusdatacore.qumulotest.local --out-dir ./od
+  assert_rc 0
+  assert_contains "Desktops/browsers: see README step 5"
+  grep -q '^### 5. Trust the CA on admin desktops (browsers)' "$REPO/README.md" || fail "README has no step 5"
+  [[ "$STDOUT" =~ SHA-1:\ +[0-9A-F]{40} ]] || fail "READY does not print a 40-hex SHA-1"
+}
+
+# The repo must not name the internal tools used to verify it. In a git
+# checkout only the repo's own files count (git-ignored local files are not
+# repo content).
+test_repo_mentions_no_internal_tools() {
+  local pattern="q""sim|sim""node|scratch""pad|cla""ude"
+  if git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    run_cmd git -C "$REPO" grep --untracked -niE "$pattern"
+  else
+    run_cmd grep -rniE "$pattern" "$REPO" --exclude-dir=.git
+  fi
+  assert_rc 1
+}
+
 run_test() {
   local t="$1"
   T_FAILED=0

@@ -1,5 +1,24 @@
 # Changelog
 
+## Upgrading from 1.x
+
+- An existing out-dir fails with `ERROR: Existing Root CA ... is missing
+  keyUsage`. Make a new out-dir (and push its root): the old root is rejected
+  by strict clients such as Python 3.13+.
+- Hosts that "passed" before may now fail honestly: a failed remote step, an
+  untrusted container TLS endpoint, or a name the cert does not cover all
+  count as failures now. Exit 2 means a real problem.
+- An empty clients file is now `ERROR:` and exit 1.
+- The root CN now carries a timestamp (`Company Lab Root CA <YYYYMMDD-HHMMSS>`).
+  Remove old roots by file (README "Cleaning up after the lab") or by SHA-1,
+  not by name.
+- `certbundle.pem` holds 3 certificates (leaf, intermediate, root).
+- CA_Faker prints the CN/SAN you asked for as "requested"; the values that
+  count are read from the cert in the `READY.` block.
+- Upgrading a running lab: re-apply the new cert to the cluster (README step
+  4) BEFORE re-pushing trust (step 3), or nodes reject the old served cert in
+  between.
+
 ## 2.0.0 (unreleased)
 
 ### All scripts
@@ -95,3 +114,11 @@
   `ERROR:` instead of a silent second CA.
 - One run at a time per CA dir (`<ca-dir>/.lock`).
 - New `ca/ca.cer`: DER copy of the root for double-click import on desktops.
+- `READY.` points desktops/browsers to README step 5 and names every folder
+  that must be kept secret.
+
+### README.md
+
+- Desktop/browser trust table (step 5), "Cleaning up after the lab",
+  "Keep the lab CA secret", exit codes, glossary, `--san` example with node
+  names and IPs, `--ca-dir` for multi-cluster labs, RHEL/Rocky support.

@@ -495,11 +495,13 @@ self_check() {
 
 print_ready() {
   local ca_crt="$1" ca_state="$2" int_crt="$3" int_state="$4" server_crt="$5" leaf_state="$6"
-  local certbundle="$7" server_key="$8" leaf_text sans suggest
+  local certbundle="$7" server_key="$8" leaf_text sans suggest secret
   leaf_text="$(openssl x509 -in "$server_crt" -noout -text)"
   sans="$(sans_from_text "$leaf_text")"
   suggest="$(cert_cn "$server_crt")"
   [[ "$suggest" == '*'* ]] && suggest="<your-cluster>"
+  secret="$OUT_DIR"
+  [[ "$(dirname "$ca_crt")" -ef "$OUT_DIR/ca" ]] || secret="$OUT_DIR and $(dirname "$ca_crt")"
 
   cat <<EOF
 
@@ -538,9 +540,12 @@ Next steps:
        qq --host <your-cluster> ssl_modify_certificate -c $certbundle -k $server_key
   3. Confirm end to end after applying:
        ./CA_Pusher.sh --clients <file> --ca $OUT_DIR --verify-tls <cluster-fqdn>:443
+  4. Desktops/browsers: see README step 5 — you will need the root CN and
+     SHA-1 above.
 
-WARNING: this root can sign certs for ANY site — keep $OUT_DIR secret and remove the root when the lab ends.
-When the lab is gone, delete $OUT_DIR — anyone with ca/*.key.pem can issue certs your machines will trust.
+WARNING: this root can sign certs for ANY site — keep $secret secret and remove the root when the lab ends.
+When the lab is gone, delete $secret — anyone with ca/*.key.pem can issue certs your machines will trust.
+See README "Cleaning up after the lab".
 
 EOF
 }
