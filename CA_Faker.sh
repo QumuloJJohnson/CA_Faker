@@ -14,6 +14,9 @@
 #   ca/ca.key.pem          (root CA private key - protect!)
 #   ca/intermediate.crt.pem, ca/intermediate.key.pem
 #                          (intermediate CA that signs the server cert - protect the key!)
+#   ca/ca.cer              (DER copy of the root CA cert, for double-click import)
+# With --ca-dir, the CA (keys included) lives in that directory instead and
+# only the public ca.crt.pem / intermediate.crt.pem / ca.cer are copied to ca/.
 #
 # Example:
 #   ./CA_Faker.sh \
@@ -49,6 +52,8 @@ SAN_OPENSSL=""
 NAME_NOTES=()
 CHECK_NAMES=0
 OUT_DIR="./qumulo-tls"
+CA_DIR=""  # defaults to <out-dir>/ca
+LOCK_DIR=""
 CA_NAME="Company Lab Root CA"
 INT_NAME="Company Lab Intermediate CA"
 CA_OU="Lab CA"
@@ -75,6 +80,9 @@ Optional:
                               Format: dns:name,ip:addr (IPs must use ip:)
                               Example: --san "dns:datacore.company.com,dns:*.datacore.company.com,ip:10.10.10.10"
   --out-dir <path>            Output directory (default: $OUT_DIR)
+  --ca-dir <path>             Where the root + intermediate CA live
+                              (default: <out-dir>/ca). Give every server of one
+                              lab the same --ca-dir to share one lab CA.
   --server-days <days>        Server cert validity days (default: $SERVER_DAYS;
                               Apple devices reject more than 825)
   --ca-days <days>            CA cert validity days (default: $CA_DAYS)
@@ -91,6 +99,7 @@ Outputs (in --out-dir):
   ca/ca.key.pem
   ca/intermediate.crt.pem
   ca/intermediate.key.pem
+  ca/ca.cer
   issued/server.crt.pem
   csr/server.csr.pem
 
@@ -131,6 +140,8 @@ parse_args() {
         shift 2 ;;
       --out-dir)
         OUT_DIR="${2:-}"; shift 2 ;;
+      --ca-dir)
+        CA_DIR="${2:-}"; shift 2 ;;
       --server-days)
         SERVER_DAYS="${2:-}"; shift 2 ;;
       --ca-days)
@@ -405,6 +416,12 @@ sans_from_text() {
   done
 }
 
+# Prints the value line under an extension header (SKI/AKI), without the
+# "keyid:" prefix that OpenSSL 1.1.1 adds to AKI.
+ext_value() {
+  printf '%s\n' "$1" | sed -n "/$2:/{n;s/^[[:space:]]*//;s/^keyid://;p;}"
+}
+
 self_check_fail() {
   err "Self-check failed: $*"
   exit 1
@@ -413,7 +430,7 @@ self_check_fail() {
 # Checks the files that will ship (staged bundle + shipped root), not the CA
 # dir, so what is published is exactly what was proven.
 self_check() {
-  local bundle="$1" ship_ca="$2" int_crt="$3" server_crt="$4" server_key="$5" chk="$6"
+  local bundle="$1" ship_ca="$2" int_crt="$3" server_crt="$4" server_key="$5" chk="$6" ship_cer="$7"
   local n entry val out root_text int_text leaf_text sans
   local -a opt
 
@@ -427,6 +444,8 @@ self_check() {
     || self_check_fail "certbundle.pem cert 2 is not $int_crt"
   [[ "$(cert_sha256 "$chk/bundle.3.pem")" == "$(cert_sha256 "$ship_ca")" ]] \
     || self_check_fail "certbundle.pem cert 3 is not $ship_ca"
+  [[ "$(openssl x509 -inform DER -in "$ship_cer" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d : | tr a-f A-F)" == "$(cert_sha256 "$ship_ca")" ]] \
+    || self_check_fail "ca.cer is not the DER form of $ship_ca"
 
   root_text="$(openssl x509 -in "$ship_ca" -noout -text)"
   int_text="$(openssl x509 -in "$chk/bundle.2.pem" -noout -text)"
@@ -465,6 +484,9 @@ self_check() {
     if ! out="$(openssl verify -x509_strict -purpose sslserver -trusted "$ship_ca" \
         -untrusted "$chk/bundle.2.pem" "${opt[@]}" "$chk/bundle.1.pem" 2>&1)"; then
       printf '%s\n' "$out" >&2
+      if [[ "$(ext_value "$leaf_text" "X509v3 Authority Key Identifier")" != "$(ext_value "$int_text" "X509v3 Subject Key Identifier")" ]]; then
+        self_check_fail "this server's cert was issued by a different lab CA (was --ca-dir rebuilt?) — rerun with --force-reissue, then re-apply with qq and re-push"
+      fi
       self_check_fail "the chain does not validate for $entry"
     fi
   done <<< "$sans"
@@ -541,7 +563,8 @@ main() {
 
   umask 077
 
-  local ca_dir="$OUT_DIR/ca"
+  local ca_dir="${CA_DIR:-$OUT_DIR/ca}"
+  local ship_dir="$OUT_DIR/ca"
   local issued_dir="$OUT_DIR/issued"
   local csr_dir="$OUT_DIR/csr"
   local tmp_dir="$OUT_DIR/tmp"
@@ -550,6 +573,9 @@ main() {
   local ca_crt="$ca_dir/ca.crt.pem"
   local int_key="$ca_dir/intermediate.key.pem"
   local int_crt="$ca_dir/intermediate.crt.pem"
+  local ship_ca_crt="$ship_dir/ca.crt.pem"
+  local ship_int_crt="$ship_dir/intermediate.crt.pem"
+  local ship_cer="$ship_dir/ca.cer"
 
   local server_key="$OUT_DIR/private.key.insecure"
   local server_csr="$csr_dir/server.csr.pem"
@@ -561,13 +587,35 @@ main() {
     local old_root_text
     old_root_text="$(openssl x509 -in "$ca_crt" -noout -text)"
     if [[ "$old_root_text" != *"X509v3 Key Usage"* ]]; then
-      err "Existing Root CA at $ca_crt was made by an older CA_Faker and is missing keyUsage; strict clients (e.g. Python 3.13+) will reject it. Use a new --out-dir to build a fresh CA."
+      err "Existing Root CA at $ca_crt was made by an older CA_Faker and is missing keyUsage; strict clients (e.g. Python 3.13+) will reject it. Use a new --out-dir (or new --ca-dir) to build a fresh CA."
       exit 1
     fi
   fi
 
-  mkdir -p "$ca_dir" "$issued_dir" "$csr_dir" "$tmp_dir"
-  chmod 700 "$OUT_DIR" "$ca_dir" "$issued_dir" "$csr_dir" "$tmp_dir" || true
+  mkdir -p "$ca_dir" "$ship_dir" "$issued_dir" "$csr_dir" "$tmp_dir"
+  chmod 700 "$OUT_DIR" "$ca_dir" "$ship_dir" "$issued_dir" "$csr_dir" "$tmp_dir" || true
+
+  # Own vs shared CA is decided by file identity, never by comparing strings
+  # (./x/ca and ./x/ca/ are the same directory).
+  local shared=0
+  [[ "$ca_dir" -ef "$ship_dir" ]] || shared=1
+  if [[ "$shared" -eq 1 && -f "$ship_dir/ca.key.pem" ]]; then
+    err "$OUT_DIR has its own CA; use a new --out-dir for a server in a shared lab CA"
+    exit 1
+  fi
+  if [[ "$shared" -eq 0 && -f "$ship_dir/ca.crt.pem" && ! -f "$ship_dir/ca.key.pem" ]]; then
+    err "$OUT_DIR uses a shared lab CA; pass the same --ca-dir as before"
+    exit 1
+  fi
+
+  # Two runs on one CA dir could build two roots or corrupt a serial file.
+  LOCK_DIR="$(cd "$ca_dir" && pwd)/.lock"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    LOCK_DIR=""
+    err "another CA_Faker run is using $ca_dir; try again (if no run is active: rmdir $(cd "$ca_dir" && pwd)/.lock)"
+    exit 1
+  fi
+  trap '[[ -n "$LOCK_DIR" ]] && rmdir "$LOCK_DIR"' EXIT
 
   info "Output directory: $OUT_DIR"
   info "Server CN (requested): $CN"
@@ -689,26 +737,46 @@ main() {
     info "Reusing existing server certificate (names below are read from it). Your --cn/--san were not applied; to change them rerun with --force-reissue, then re-apply certbundle.pem AND private.key.insecure with qq."
   fi
 
-  # 5) Build certbundle.pem in Qumulo order (leaf -> intermediate -> root) in
-  #    tmp/ and publish it only after every self-check passes.
+  # 5) Build certbundle.pem in Qumulo order (leaf -> intermediate -> root),
+  #    the public CA copies and ca.cer in tmp/; publish them only after every
+  #    self-check passes.
   local staged_bundle="$tmp_dir/certbundle.pem"
+  local staged_ca="$ca_crt"
+  local staged_int="$tmp_dir/ship.intermediate.crt.pem"
+  local staged_cer="$tmp_dir/ca.cer"
   info "Building certbundle.pem (leaf -> intermediate -> root) -> $certbundle"
-  rm -f "$staged_bundle"
-  cat "$server_crt" "$int_crt" "$ca_crt" > "$staged_bundle"
+  rm -f "$staged_bundle" "$staged_int" "$staged_cer" "$tmp_dir/ship.ca.crt.pem"
+  if [[ "$shared" -eq 1 ]]; then
+    staged_ca="$tmp_dir/ship.ca.crt.pem"
+    cp "$ca_crt" "$staged_ca"
+    cp "$int_crt" "$staged_int"
+  fi
+  cat "$server_crt" "$int_crt" "$staged_ca" > "$staged_bundle"
+  openssl x509 -in "$staged_ca" -outform DER -out "$staged_cer"
 
   # 6) Verification checks
   info "Self-check: chain, extensions, key match and every name in the cert..."
-  self_check "$staged_bundle" "$ca_crt" "$int_crt" "$server_crt" "$server_key" "$tmp_dir/check"
+  self_check "$staged_bundle" "$staged_ca" "$int_crt" "$server_crt" "$server_key" "$tmp_dir/check" "$staged_cer"
 
-  chmod 444 "$staged_bundle"
-  rm -f "$certbundle"
+  chmod 444 "$staged_bundle" "$staged_cer"
+  rm -f "$certbundle" "$ship_cer"
   mv "$staged_bundle" "$certbundle"
+  mv "$staged_cer" "$ship_cer"
+  if [[ "$shared" -eq 1 ]]; then
+    chmod 444 "$staged_ca" "$staged_int"
+    rm -f "$ship_ca_crt" "$ship_int_crt"
+    mv "$staged_ca" "$ship_ca_crt"
+    mv "$staged_int" "$ship_int_crt"
+  fi
 
   info "Showing server certificate subject + SANs..."
   openssl x509 -in "$server_crt" -noout -subject -issuer -dates >&2
   openssl x509 -in "$server_crt" -noout -ext subjectAltName >&2 || true
 
   print_ready "$ca_crt" "$ca_state" "$int_crt" "$int_state" "$server_crt" "$leaf_state" "$certbundle" "$server_key"
+  if [[ "$shared" -eq 1 ]]; then
+    info "Shared lab CA in $ca_dir; public copies for CA_Pusher --ca $OUT_DIR are in $ship_dir"
+  fi
 }
 
 main "$@"

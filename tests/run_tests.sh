@@ -677,6 +677,157 @@ test_pusher_tls_check_validates_chain_and_name() {
   stop_tls_server
 }
 
+# One lab CA dir shared by two servers (built once per run).
+shared_lab() {
+  if [[ ! -d "$CACHE/shared" ]]; then
+    mkdir -p "$CACHE/shared"
+    (cd "$CACHE/shared" \
+      && "$FAKER" --cn a.qumulotest.local --out-dir ./a --ca-dir ./lab >/dev/null 2>&1 \
+      && "$FAKER" --cn b.qumulotest.local --out-dir ./b --ca-dir ./lab >/dev/null 2>&1) \
+      || { fail "could not build the shared lab fixture"; return 1; }
+  fi
+  cp -a "$CACHE/shared/." .
+}
+
+test_faker_readme_quick_start_keeps_todays_file_layout() {
+  run_cmd "$FAKER" --cn myserver.lab.example.com --out-dir ./qumulo-tls
+  assert_rc 0
+  local f
+  for f in private.key.insecure certbundle.pem ca/ca.crt.pem ca/ca.key.pem \
+      issued/server.crt.pem csr/server.csr.pem; do
+    assert_file "qumulo-tls/$f"
+  done
+}
+
+test_faker_paths_with_spaces_work() {
+  run_cmd "$FAKER" --cn a.qumulotest.local --out-dir "./my lab/a" --ca-dir "./my lab/lab ca"
+  assert_rc 0
+  assert_file "my lab/a/certbundle.pem"
+  assert_eq "$(fp "my lab/a/ca/ca.crt.pem")" "$(fp "my lab/lab ca/ca.crt.pem")" "shipped root"
+  [[ ! -d "my lab/lab ca/.lock" ]] || fail "lock left behind"
+}
+
+test_faker_writes_der_copy_of_root() {
+  faker_outdir od || return 1
+  assert_eq "$(openssl x509 -inform DER -in od/ca/ca.cer -noout -fingerprint -sha256 | cut -d= -f2 | tr -d : | tr a-f A-F)" \
+    "$(fp od/ca/ca.crt.pem)" "ca.cer fingerprint"
+}
+
+test_faker_shared_ca_dir_serves_two_servers_with_one_root() {
+  shared_lab || return 1
+  local root_before
+  root_before="$(fp lab/ca.crt.pem) $(fp lab/intermediate.crt.pem)"
+  run_cmd "$FAKER" --cn b.qumulotest.local --out-dir ./b --ca-dir ./lab
+  assert_rc 0
+  assert_eq "$(fp lab/ca.crt.pem) $(fp lab/intermediate.crt.pem)" "$root_before" "lab CA after rerun"
+  assert_eq "$(fp a/ca/ca.crt.pem)" "$(fp lab/ca.crt.pem)" "a/ca/ca.crt.pem"
+  assert_eq "$(fp b/ca/ca.crt.pem)" "$(fp lab/ca.crt.pem)" "b/ca/ca.crt.pem"
+  assert_eq "$(fp a/ca/intermediate.crt.pem)" "$(fp lab/intermediate.crt.pem)" "a/ca/intermediate.crt.pem"
+  assert_no_file a/ca/ca.key.pem
+  assert_no_file a/ca/intermediate.key.pem
+  assert_no_file b/ca/ca.key.pem
+  local h
+  for h in a b; do
+    run_cmd openssl verify -x509_strict -purpose sslserver -trusted lab/ca.crt.pem \
+      -untrusted lab/intermediate.crt.pem -verify_hostname "$h.qumulotest.local" "$h/issued/server.crt.pem"
+    assert_rc 0
+  done
+  printf '# none\n' > clients.txt
+  run_cmd "$PUSHER" --clients clients.txt --ca ./a
+  assert_contains "ERROR: No hosts found"
+}
+
+test_faker_ca_dir_spelled_differently_is_still_own_ca() {
+  faker_outdir od || return 1
+  local root_before
+  root_before="$(fp od/ca/ca.crt.pem)"
+  run_cmd "$FAKER" --cn stratusdatacore.qumulotest.local --out-dir ./od --ca-dir ./od/ca/
+  assert_rc 0
+  assert_eq "$(fp od/ca/ca.crt.pem)" "$root_before" "root fingerprint"
+  assert_file od/ca/ca.key.pem
+}
+
+test_faker_shared_out_dir_rerun_without_ca_dir_fails() {
+  shared_lab || return 1
+  run_cmd "$FAKER" --cn a.qumulotest.local --out-dir ./a
+  assert_rc 1
+  assert_contains "ERROR: ./a uses a shared lab CA; pass the same --ca-dir as before"
+  assert_no_file a/ca/ca.key.pem
+}
+
+test_faker_own_ca_out_dir_given_ca_dir_fails() {
+  faker_outdir od || return 1
+  run_cmd "$FAKER" --cn stratusdatacore.qumulotest.local --out-dir ./od --ca-dir ./lab
+  assert_rc 1
+  assert_contains "ERROR: ./od has its own CA; use a new --out-dir for a server in a shared lab CA"
+  assert_no_file lab/ca.crt.pem
+}
+
+test_faker_held_ca_lock_fails_with_rmdir_hint() {
+  mkdir -p lab/.lock
+  run_cmd "$FAKER" --cn a.qumulotest.local --out-dir ./a --ca-dir ./lab
+  assert_rc 1
+  assert_contains "ERROR: another CA_Faker run is using ./lab; try again (if no run is active: rmdir $PWD/lab/.lock)"
+  assert_no_file lab/ca.crt.pem
+  [[ -d lab/.lock ]] || fail "the other run's lock was removed"
+}
+
+# Whichever run loses the race must fail on the lock; either way the lab
+# ends up with exactly one root.
+test_faker_concurrent_runs_on_one_ca_dir_build_one_root() {
+  "$FAKER" --cn a.qumulotest.local --out-dir ./a --ca-dir ./lab >a.log 2>&1 &
+  local pa=$!
+  "$FAKER" --cn b.qumulotest.local --out-dir ./b --ca-dir ./lab >b.log 2>&1 &
+  local pb=$! ra=0 rb=0
+  wait "$pa" || ra=$?
+  wait "$pb" || rb=$?
+  local h rc
+  for h in a b; do
+    [[ "$h" == a ]] && rc=$ra || rc=$rb
+    if [[ "$rc" -eq 0 ]]; then
+      assert_eq "$(fp "$h/ca/ca.crt.pem")" "$(fp lab/ca.crt.pem)" "$h root"
+    else
+      grep -q "another CA_Faker run is using ./lab" "$h.log" || fail "$h failed for another reason: $(tail -1 "$h.log")"
+    fi
+  done
+  [[ "$ra" -eq 0 || "$rb" -eq 0 ]] || fail "both runs failed"
+  [[ ! -d lab/.lock ]] || fail "lock left behind"
+}
+
+test_faker_rebuilt_ca_dir_fails_with_hint_and_keeps_bundle() {
+  shared_lab || return 1
+  local bundle_before
+  bundle_before="$(openssl dgst -sha256 < a/certbundle.pem)"
+  rm -rf lab
+  run_cmd "$FAKER" --cn b.qumulotest.local --out-dir ./b2 --ca-dir ./lab
+  assert_rc 0
+  run_cmd "$FAKER" --cn a.qumulotest.local --out-dir ./a --ca-dir ./lab
+  assert_rc 1
+  assert_contains "this server's cert was issued by a different lab CA (was --ca-dir rebuilt?) — rerun with --force-reissue, then re-apply with qq and re-push"
+  assert_eq "$(openssl dgst -sha256 < a/certbundle.pem)" "$bundle_before" "a/certbundle.pem"
+  run_cmd "$FAKER" --cn a.qumulotest.local --out-dir ./a --ca-dir ./lab --force-reissue
+  assert_rc 0
+  assert_eq "$(fp a/ca/ca.crt.pem)" "$(fp lab/ca.crt.pem)" "a root after reissue"
+}
+
+test_faker_old_root_in_ca_dir_is_refused_unless_key_missing() {
+  mkdir -p lab
+  openssl genrsa -out lab/ca.key.pem 2048 >/dev/null 2>&1
+  openssl req -x509 -new -nodes -key lab/ca.key.pem -sha256 -days 30 \
+    -out lab/ca.crt.pem -subj "/C=US/O=Company Lab/CN=Company Lab Root CA" >/dev/null 2>&1
+  if [[ "$(openssl x509 -in lab/ca.crt.pem -noout -text)" == *"X509v3 Key Usage"* ]]; then
+    skip "this openssl.cnf adds keyUsage to req -x509, so no old-style root can be made here"
+    return 0
+  fi
+  run_cmd "$FAKER" --cn a.qumulotest.local --out-dir ./a --ca-dir ./lab
+  assert_rc 1
+  assert_contains "Use a new --out-dir (or new --ca-dir) to build a fresh CA."
+  rm -f lab/ca.key.pem
+  run_cmd "$FAKER" --cn a.qumulotest.local --out-dir ./a --ca-dir ./lab
+  assert_rc 0
+  [[ "$(openssl x509 -in lab/ca.crt.pem -noout -text)" == *"X509v3 Key Usage"* ]] || fail "root was not rebuilt"
+}
+
 run_test() {
   local t="$1"
   T_FAILED=0

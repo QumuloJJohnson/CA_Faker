@@ -87,3 +87,11 @@
 - `--server-days` above 825 prints a WARNING (Apple's limit).
 - New `--check-names`: validates `--cn`/`--san`, prints the final SAN list
   one entry per line, writes nothing.
+- New optional `--ca-dir <path>` (default `<out-dir>/ca`, today's layout).
+  Give every server of one lab the same `--ca-dir` to share one root and
+  intermediate; the out-dir then gets only the public `ca/ca.crt.pem` and
+  `ca/intermediate.crt.pem`, so `CA_Pusher.sh --ca <out-dir>` works as
+  before. Mixing an own-CA out-dir with a shared CA (or the reverse) is an
+  `ERROR:` instead of a silent second CA.
+- One run at a time per CA dir (`<ca-dir>/.lock`).
+- New `ca/ca.cer`: DER copy of the root for double-click import on desktops.
