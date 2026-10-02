@@ -139,3 +139,16 @@
 - Desktop/browser trust table (step 5), "Cleaning up after the lab",
   "Keep the lab CA secret", exit codes, glossary, `--san` example with node
   names and IPs, `--ca-dir` for multi-cluster labs, RHEL/Rocky support.
+
+### CA_Lab.sh (new)
+
+- The easy button: `./CA_Lab.sh --clusters clusters.txt --clients clients.txt
+  --ssh-user <user>` issues a cert from one lab CA for every cluster, applies
+  it with `qq`, makes every listed machine (and its container) trust the lab,
+  and proves every machine validates every cluster. Exit 0 only when
+  everything listed was done and proven.
+- One-time lab SSH key push, passwords asked once each (or `CA_LAB_*_PASSWORD`
+  without a TTY), `--ssh-key` for an existing key, `--dry-run`.
+- `inventory.txt` and a log per run in the lab-dir; `--remove` removes every
+  root this lab pushed and the lab key, with proof; `--forget <host>` for
+  machines that no longer exist.

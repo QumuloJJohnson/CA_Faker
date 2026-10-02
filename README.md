@@ -27,6 +27,9 @@ Terms used below:
   `certbundle.pem` and the public CA certs.
 - **ca-dir**: where the lab CA and its keys live (`CA_Faker.sh --ca-dir`,
   default `<out-dir>/ca`). Share one per lab.
+- **lab-dir**: CA_Lab's folder for one whole lab (`--lab-dir`, default
+  `./lab-tls`): the lab CA, one out-dir per cluster, the lab SSH key, the
+  inventory and the logs.
 
 See [CHANGELOG.md](CHANGELOG.md), including **Upgrading from 1.x**.
 
@@ -52,8 +55,10 @@ A lab CA is a root that every machine you add it to will trust for ANY site.
 Whoever has `ca/ca.key.pem` or `ca/intermediate.key.pem` can impersonate any
 HTTPS site to those machines until the root expires or is removed.
 
-- Treat the out-dir and ca-dir as **secrets**: never commit, zip, email or put
-  them on shared storage. `private.key.insecure` is a secret too.
+- Treat the out-dir, ca-dir and lab-dir as **secrets**: never commit, zip,
+  email or put them on shared storage. `private.key.insecure`, CA_Lab's
+  `ssh/id_ed25519` (it is root on hosts with passwordless sudo) and
+  `inventory.txt` are secrets too.
 - When the lab ends, remove the root from every machine (see
   [Cleaning up after the lab](#cleaning-up-after-the-lab)) and delete the
   folders.
@@ -61,7 +66,92 @@ HTTPS site to those machines until the root expires or is removed.
   when needed. Check with IT/InfoSec before adding a root to a managed laptop
   (EDR/MDM tools may flag it).
 
-## Quick Start
+## Easy button: CA_Lab.sh
+
+One lab = one CA. List your clusters and your other machines in two text
+files, run one command, and every listed machine trusts the lab and validates
+every listed cluster. CA_Lab.sh drives CA_Faker.sh, CA_Pusher.sh and `qq`;
+the step-by-step Quick Start below does the same by hand.
+
+Needs a Linux or WSL admin machine with `qq`, `ssh`, `ssh-keygen`,
+`ssh-copy-id`, `sshpass` (only for the one-time key push) and `setsid`.
+
+1. `clusters.txt`: one cluster per line, `#` comments and blank lines ignored.
+   First the cluster's FQDN, then any extra `dns:`/`ip:` names for its cert,
+   then its nodes as `ssh:<node>` (CA_Lab logs into them; they are never put in
+   the cert):
+   ```
+   # <cluster FQDN>  [dns:/ip: names for the cert]  [ssh:<node> ...]
+   stratusdatacore.qumulotest.local  ip:10.1.1.10 dns:node1.qumulotest.local ssh:10.1.1.11 ssh:10.1.1.12
+   clusterb.qumulotest.local         ip:10.1.2.10 ssh:10.1.2.11
+   ```
+   Put cluster nodes here as `ssh:` entries, not in `clients.txt`: only `ssh:`
+   nodes have their `qcore` container required and count toward "trusted on
+   nodes".
+2. `clients.txt`: every other machine that talks to the lab, one per line
+   (the same format as CA_Pusher's clients file):
+   ```
+   client1.qumulotest.local
+   10.1.3.20
+   ```
+3. Run it:
+   ```bash
+   ./CA_Lab.sh --clusters clusters.txt --clients clients.txt --ssh-user admin
+   ```
+   It asks each password once, hidden: the SSH password (only if the lab key
+   is not installed yet), the sudo password (only where sudo needs one) and
+   the Qumulo admin password. It assumes one SSH/sudo user and password for
+   all `clients.txt` hosts and one for all `ssh:` nodes (`--node-user`; may be
+   the same).
+4. Read the summary. Exit 0 means everything listed was done AND proven;
+   anything else is listed under `Not done:` and the exit code is 2.
+5. Trust the lab on admin desktops per step 5 below (the summary prints the
+   root CN and SHA-1).
+
+What one run does, in order: checks both files and every name (nothing is
+changed if anything is wrong); creates the lab SSH key once and pushes it to
+machines that do not have it yet; issues a cert for every cluster from the lab
+CA (reissued automatically when the cluster's line or the lab CA changed);
+applies it with `qq` unless the cluster already serves it, then waits until
+it is served; installs the lab root on every machine and its container and
+checks that each one validates every cluster on port 443 (fixed); and finally
+checks every name in each cert from the admin machine.
+
+| Flag | Description |
+|------|-------------|
+| `--clusters <file>` / `--clients <file>` | The two files; at least one is required. `--clients` alone re-checks an existing lab |
+| `--ssh-user <name>` | SSH + sudo user on every machine (prompted if omitted) |
+| `--node-user <name>` | Different SSH + sudo user for `ssh:` nodes (default: `--ssh-user`) |
+| `--node-container <name>` | Container on `ssh:` nodes (default `qcore`; `none` to skip) |
+| `--container <name>` | Container on `clients.txt` hosts (default: none, as CA_Pusher) |
+| `--lab-dir <path>` | Lab folder (default `./lab-tls`) |
+| `--qq-user <name>` | Qumulo admin user (default `admin`) |
+| `--port <n>`, `--timeout <sec>` | SSH port and connect timeout |
+| `--ssh-key <path>` | Use an existing unencrypted key (mode 600) instead of the lab key; no key push |
+| `--new-lab` | Allow creating a new lab CA when there is no TTY to confirm it |
+| `--dry-run` | Show the checks, targets and which clusters would be (re)issued; change nothing |
+| `--remove` | Remove this lab from every machine in the inventory, then the lab key |
+| `--forget <host>` | Drop a host (e.g. a destroyed VM) from the inventory without contacting it |
+| `--version` | Show version |
+
+Good to know:
+- A new lab CA lives 730 days. Creating one asks for confirmation (or
+  `--new-lab` without a TTY); a mistyped `--lab-dir` is caught that way.
+- Without a TTY, passwords come only from `CA_LAB_SSH_PASSWORD`,
+  `CA_LAB_SUDO_PASSWORD` and `CA_LAB_QQ_PASSWORD`; stdin is never read.
+- Each run writes `<lab-dir>/logs/<time>.log` (no passwords) and keeps
+  `<lab-dir>/inventory.txt`: every machine and every lab root pushed to it, so
+  `--remove` can clean them all.
+- Each lab's root is installed as `company-lab-root-ca-<12 hex>.crt`, so
+  several labs can share a machine.
+- `--clients` alone checks clusters already in the lab-dir. Delete
+  `<lab-dir>/<fqdn>` for clusters that no longer exist, or they keep failing.
+- Rerun CA_Lab after a Qumulo upgrade, a node replacement or a new `qcore`
+  image (tested with Qumulo Core 7.8.4.3 and 7.9.0).
+- A cluster line with no `ssh:` nodes still gets a cert, but its own
+  processes won't trust the lab; the run then ends with exit 2.
+
+## Quick Start (doing it step by step)
 
 ### 1. Generate CA + server certificate (run on your admin machine)
 
@@ -191,6 +281,12 @@ Do this in order when the lab is gone:
    (If you used `--trust-name <name>`, the file is `<name>.crt`.)
 4. Delete the out-dir (and the ca-dir) **last**.
 
+With CA_Lab, `./CA_Lab.sh --remove --lab-dir <lab-dir>` does step 3 for every
+machine in the inventory (every root this lab ever pushed, host and container),
+proves each removal, then removes the lab SSH key from `authorized_keys` (only
+where trust was removed). It prints the desktop steps and what is left; then
+delete the lab-dir.
+
 ## CA_Faker.sh Options
 
 | Flag | Description |
@@ -282,6 +378,7 @@ is informational (a different root was overwritten).
 |--------|---|---|---|
 | CA_Faker.sh | everything built and proven | error, nothing published | — |
 | CA_Pusher.sh | every host done | bad arguments or input (nothing pushed) | one or more hosts failed |
+| CA_Lab.sh | everything listed done and proven | bad input or setup error (no cluster or trust store changed) | something not done or not proven (see `Not done:`) |
 
 ## Output Files
 
@@ -335,3 +432,6 @@ echo | openssl s_client -connect <cluster-a-host>:443 \
 - `.local` names are also used by mDNS/Bonjour, so on macOS a name that
   "won't resolve" is a DNS issue, not a certificate issue — make sure the lab
   DNS server answers for `qumulotest.local`.
+- CA_Lab turns the SSH agent off for its own SSH calls and for CA_Pusher. An
+  `IdentityAgent` line in `~/.ssh/config` can still affect CA_Pusher's calls;
+  the worst case is a host reported as failed, never a false pass.

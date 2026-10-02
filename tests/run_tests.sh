@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/run_tests.sh
 #
-# Local checks for CA_Faker.sh and CA_Pusher.sh.
+# Local checks for CA_Faker.sh, CA_Pusher.sh and CA_Lab.sh.
 # Needs only bash and openssl: no containers, no network, no root.
 #
 # Usage:
@@ -16,6 +16,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FAKER="$REPO/CA_Faker.sh"
 PUSHER="$REPO/CA_Pusher.sh"
+LAB="$REPO/CA_Lab.sh"
 
 CACHE="$(mktemp -d)"
 WORK=""
@@ -606,6 +607,9 @@ test_versions_report_2_0_0() {
   run_cmd "$PUSHER" --version
   assert_rc 0
   assert_eq "$STDOUT" "CA_Pusher.sh 2.0.0" "CA_Pusher --version"
+  run_cmd "$LAB" --version
+  assert_rc 0
+  assert_eq "$STDOUT" "CA_Lab.sh 2.0.0" "CA_Lab --version"
 }
 
 # CA_Pusher carries its own copy of the name rules; they must not drift.
@@ -832,7 +836,7 @@ test_faker_old_root_in_ca_dir_is_refused_unless_key_missing() {
 # Every flag in a script's --help must be documented in its README table.
 test_readme_documents_every_flag() {
   local script flag help n
-  for script in CA_Faker.sh CA_Pusher.sh; do
+  for script in CA_Faker.sh CA_Pusher.sh CA_Lab.sh; do
     if ! help="$("$REPO/$script" --help 2>&1)"; then
       fail "$script --help failed"
       continue
@@ -954,6 +958,284 @@ test_pusher_sudo_password_stdin_reads_without_prompt() {
   assert_rc 2
   assert_not_contains "Remote sudo password"
   assert_contains "[127.0.0.1] no sudo password was given and u cannot sudo without one"
+}
+
+write_lab_inputs() {
+  cat > clusters.txt <<'EOF'
+# <cluster FQDN>  [dns:/ip: names for the cert]  [ssh:<node> ...]
+stratusdatacore.qumulotest.local  ip:10.1.1.10 dns:node1.qumulotest.local ssh:10.1.1.11
+clusterb.qumulotest.local         ip:10.1.2.10 ssh:10.1.2.11
+EOF
+  printf 'client1.qumulotest.local\n10.1.1.11\n' > clients.txt
+}
+
+# A lab as CA_Lab leaves it after issuing stratusdatacore (no SSH key yet,
+# so a dry run never contacts anything).
+make_lab() {
+  "$FAKER" --cn stratusdatacore.qumulotest.local --san "dns:node1.qumulotest.local,ip:10.1.1.10" \
+    --out-dir lab/stratusdatacore.qumulotest.local --ca-dir lab/ca >/dev/null 2>&1 \
+    || { fail "could not build the lab fixture"; return 1; }
+  printf '%s\n%s\n' "stratusdatacore.qumulotest.local dns:node1.qumulotest.local ip:10.1.1.10" \
+    "$(fp lab/ca/ca.crt.pem)" > lab/stratusdatacore.qumulotest.local/clusters-line.txt
+}
+
+# Listing with full timestamps; the parent entry ("..") is left out because
+# the test itself writes next to the folder.
+tree_state() {
+  { ls -laR --time-style=full-iso "$1" 2>/dev/null || ls -laRT "$1"; } | sed '/ \.\.$/d'
+}
+
+test_lab_refuses_tracing() {
+  run_cmd bash -x "$LAB" --version
+  assert_rc 1
+  assert_contains "ERROR: do not trace CA_Lab — it handles passwords"
+}
+
+test_lab_needs_an_input_file() {
+  run_cmd "$LAB" --ssh-user admin
+  assert_rc 1
+  assert_contains "ERROR: give --clusters and/or --clients"
+  run_cmd "$LAB" --clusters nope.txt --ssh-user admin
+  assert_rc 1
+  assert_contains "ERROR: file not found: nope.txt"
+}
+
+test_lab_rejects_bad_cluster_lines_before_creating_anything() {
+  local -a bad=(
+    "stratusdatacore ssh:10.1.1.11"
+    "*.qumulotest.local ssh:10.1.1.11"
+    "a.qumulotest.local foo:bar"
+    "a.qumulotest.local ssh:root@10.1.1.11"
+    "a.qumulotest.local dns:10.0.0.1"
+    "a.qumulotest.local ip:10.0.0.999"
+    "a.qumulotest.local ssh:"
+  )
+  local line
+  for line in "${bad[@]}"; do
+    printf '%s\n' "$line" > clusters.txt
+    run_cmd "$LAB" --clusters clusters.txt --ssh-user admin --new-lab
+    [[ "$RC" -eq 1 ]] || fail "expected exit 1 for: $line (got $RC)"
+    [[ "$OUT" == *"ERROR: clusters.txt line 1:"* ]] || fail "expected a line error for: $line"
+    [[ ! -e lab-tls ]] || fail "lab-tls was created for: $line"
+  done
+  printf 'a.qumulotest.local\nA.qumulotest.local\n' > clusters.txt
+  run_cmd "$LAB" --clusters clusters.txt --ssh-user admin --new-lab
+  assert_rc 1
+  assert_contains "ERROR: clusters.txt line 2: a.qumulotest.local is listed twice"
+}
+
+# Files edited on Windows end lines with CR.
+test_lab_accepts_crlf_input_files() {
+  printf 'stratusdatacore.qumulotest.local ip:10.1.1.10 ssh:10.1.1.11\r\n' > clusters.txt
+  printf 'client1.qumulotest.local\r\n' > clients.txt
+  run_cmd "$LAB" --clusters clusters.txt --clients clients.txt --ssh-user admin --dry-run
+  assert_rc 0
+  assert_not_contains "ERROR:"
+  assert_contains "Target 10.1.1.11: node, user admin, container qcore"
+  assert_contains "Target client1.qumulotest.local: client"
+}
+
+# A machine in both files (any case) is one target, treated as a node.
+test_lab_dedups_targets_case_insensitively_node_wins() {
+  printf 'stratusdatacore.qumulotest.local ssh:Node1.qumulotest.local\n' > clusters.txt
+  printf 'node1.qumulotest.local\nNODE1.qumulotest.local\n' > clients.txt
+  run_cmd "$LAB" --clusters clusters.txt --clients clients.txt --ssh-user admin --dry-run
+  assert_rc 0
+  assert_eq "$(grep -c '^INFO: Target ' <<< "$OUT")" 1 "number of targets"
+  assert_contains "Target node1.qumulotest.local: node, user admin, container qcore"
+}
+
+test_lab_rejects_bad_client_lines() {
+  printf 'ok.qumulotest.local\nadmin@node1\n' > clients.txt
+  make_lab || return 1
+  run_cmd "$LAB" --clients clients.txt --ssh-user admin --lab-dir ./lab
+  assert_rc 1
+  assert_contains "ERROR: clients.txt line 2: 'admin@node1' is not a valid host"
+}
+
+test_lab_clients_only_needs_an_existing_lab_ca() {
+  write_lab_inputs
+  run_cmd "$LAB" --clients clients.txt --ssh-user admin
+  assert_rc 1
+  assert_contains "ERROR: no lab CA yet — run with --clusters first"
+  assert_no_file lab-tls
+}
+
+test_lab_new_lab_needs_tty_or_new_lab() {
+  write_lab_inputs
+  run_cmd "$LAB" --clusters clusters.txt --clients clients.txt --ssh-user admin
+  assert_rc 1
+  assert_contains "Creating a NEW lab CA in $PWD/lab-tls"
+  assert_contains "ERROR: no TTY to confirm a new lab CA; rerun with --new-lab"
+  assert_no_file lab-tls
+}
+
+test_lab_dry_run_on_new_lab_writes_nothing() {
+  write_lab_inputs
+  run_cmd "$LAB" --clusters clusters.txt --clients clients.txt --ssh-user admin --dry-run
+  assert_rc 0
+  assert_contains "Would create a NEW lab CA in $PWD/lab-tls"
+  assert_contains "Target 10.1.1.11: node, user admin, container qcore"
+  assert_contains "Target client1.qumulotest.local: client, user admin, container (none)"
+  assert_contains "client1.qumulotest.local: key push needed (untested)"
+  assert_contains "stratusdatacore.qumulotest.local: would issue a cert (new cluster) and apply it"
+  assert_contains "Dry run: nothing was changed"
+  assert_no_file lab-tls
+}
+
+# Dry run with the given clusters.txt line; the lab folder must not change.
+lab_dry_run_with_line() {
+  local before
+  printf '%s\n' "$1" > clusters.txt
+  before="$(tree_state lab)"
+  run_cmd "$LAB" --clusters clusters.txt --ssh-user admin --lab-dir ./lab --dry-run
+  assert_rc 0
+  [[ "$(tree_state lab)" == "$before" ]] || fail "dry run changed the lab folder"
+}
+
+# The reissue decision is a plain text compare of the normalised line and
+# the lab root: the same line (any order, case of type/FQDN, spacing) does
+# not reissue.
+test_lab_reissues_only_when_line_or_lab_ca_changes() {
+  make_lab || return 1
+  local line_file=lab/stratusdatacore.qumulotest.local/clusters-line.txt
+
+  lab_dry_run_with_line "STRATUSDATACORE.qumulotest.local   IP:10.1.1.10   ssh:10.1.1.11 dns:node1.qumulotest.local"
+  assert_contains "stratusdatacore.qumulotest.local: cert unchanged"
+
+  lab_dry_run_with_line "stratusdatacore.qumulotest.local ip:10.1.1.10 ip:10.1.1.20 dns:node1.qumulotest.local ssh:10.1.1.11"
+  assert_contains "stratusdatacore.qumulotest.local: would issue a cert (its clusters.txt line changed)"
+
+  printf '%s\n%s\n' "stratusdatacore.qumulotest.local dns:node1.qumulotest.local ip:10.1.1.10" \
+    "0000" > "$line_file"
+  lab_dry_run_with_line "stratusdatacore.qumulotest.local ip:10.1.1.10 dns:node1.qumulotest.local ssh:10.1.1.11"
+  assert_contains "stratusdatacore.qumulotest.local: would issue a cert (the lab CA changed)"
+
+  rm -f "$line_file"
+  lab_dry_run_with_line "stratusdatacore.qumulotest.local ip:10.1.1.10 dns:node1.qumulotest.local ssh:10.1.1.11"
+  assert_contains "stratusdatacore.qumulotest.local: would issue a cert (new cluster)"
+}
+
+test_lab_lines_without_names_or_with_ipv6_do_not_reissue() {
+  make_lab || return 1
+  local root
+  root="$(fp lab/ca/ca.crt.pem)"
+  mkdir -p lab/clusterb.qumulotest.local lab/clusterc.qumulotest.local
+  printf '%s\n%s\n' "clusterb.qumulotest.local" "$root" > lab/clusterb.qumulotest.local/clusters-line.txt
+  printf '%s\n%s\n' "clusterc.qumulotest.local ip:2001:db8::10" "$root" > lab/clusterc.qumulotest.local/clusters-line.txt
+  printf '%s\n' "clusterb.qumulotest.local ssh:10.1.2.11" "clusterc.qumulotest.local ip:2001:db8::10" > clusters.txt
+  run_cmd "$LAB" --clusters clusters.txt --ssh-user admin --lab-dir ./lab --dry-run
+  assert_rc 0
+  assert_contains "clusterb.qumulotest.local: cert unchanged"
+  assert_contains "clusterc.qumulotest.local: cert unchanged"
+  assert_contains "WARNING: clusterc.qumulotest.local has no ssh: nodes — it gets a cert, but its own processes won't trust the lab; this run will end with exit 2"
+}
+
+# Run CA_Lab's inventory functions on their own.
+run_inv_update() {
+  {
+    sed -n '/^inv_file() {/,/^}/p;/^inv_update() {/,/^}/p' "$LAB"
+    echo 'inv_update "$@"'
+  } > inv.sh
+  LAB_ABS="$PWD/lab" DRY_RUN=0 bash -c 'source ./inv.sh' _ "$@"
+}
+
+# Write-ahead inventory: a host is recorded before anything is pushed, every
+# root ever pushed stays listed, and an installed container stays installed.
+test_lab_inventory_records_every_root_and_keeps_installed() {
+  mkdir -p lab
+  run_inv_update node1 labu node "qcore:pending" lab ""
+  assert_eq "$(cut -f4,5,6 lab/inventory.txt)" $'qcore:pending\tlab\t-' "first write, no root yet"
+  run_inv_update node1 labu node "qcore:pending" lab "AAAA"
+  run_inv_update node1 labu node "qcore:installed" lab "AAAA"
+  run_inv_update NODE1 labu node "qcore:pending" lab "BBBB"
+  run_inv_update node2 labu client "-" "own:/k" "BBBB"
+  assert_eq "$(wc -l < lab/inventory.txt | tr -d ' ')" 2 "inventory lines"
+  assert_eq "$(sed -n 1p lab/inventory.txt | cut -f1,4,6)" $'node1\tqcore:installed\tAAAA,BBBB' "node1 line"
+  assert_eq "$(sed -n 2p lab/inventory.txt | cut -f1,4,5,6)" $'node2\t-\town:/k\tBBBB' "node2 line"
+  [[ "$(sed -n 1p lab/inventory.txt | cut -f7)" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || fail "date field"
+}
+
+test_lab_refuses_an_older_sibling_script() {
+  cp "$FAKER" "$PUSHER" "$LAB" .
+  sed -i.bak 's/^VERSION="2.0.0"$/VERSION="1.9.0"/' ./CA_Pusher.sh
+  rm -f ./CA_Pusher.sh.bak
+  write_lab_inputs
+  run_cmd ./CA_Lab.sh --clusters clusters.txt --ssh-user admin --dry-run
+  assert_rc 1
+  assert_contains "ERROR: CA_Pusher.sh is older than CA_Lab.sh — update both"
+}
+
+test_lab_rejects_ssh_key_that_needs_a_prompt() {
+  ssh-keygen -q -t ed25519 -N "secret-phrase" -f enc >/dev/null
+  write_lab_inputs
+  run_cmd "$LAB" --clusters clusters.txt --ssh-user admin --ssh-key enc --dry-run
+  assert_rc 1
+  assert_contains "ERROR: --ssh-key enc can't be used without a prompt:"
+  assert_contains "omit --ssh-key to use the lab key, or use an unencrypted key with mode 600"
+  ssh-keygen -q -t ed25519 -N "" -f plain >/dev/null
+  chmod 644 plain
+  run_cmd "$LAB" --clusters clusters.txt --ssh-user admin --ssh-key plain --dry-run
+  assert_rc 1
+  assert_contains "ERROR: --ssh-key plain can't be used without a prompt:"
+}
+
+# Without a TTY a needed password comes only from CA_LAB_*_PASSWORD.
+test_lab_no_tty_without_password_env_fails() {
+  local c
+  for c in ssh ssh-keygen ssh-copy-id sshpass; do
+    command -v "$c" >/dev/null 2>&1 || { skip "$c not installed"; return 0; }
+  done
+  make_lab || return 1
+  echo "127.0.0.1" > clients.txt
+  run_in $'typed-secret\n' env -u CA_LAB_SSH_PASSWORD "$LAB" --clients clients.txt --ssh-user u \
+    --lab-dir ./lab --port 1 --timeout 2
+  assert_rc 1
+  assert_contains "ERROR: no TTY — set CA_LAB_*_PASSWORD or run interactively"
+  [[ ! -d lab/.lock ]] || fail "lock left behind"
+}
+
+test_lab_held_lock_fails_with_hint() {
+  make_lab || return 1
+  mkdir lab/.lock
+  echo "4242 otherbox" > lab/.lock/owner
+  printf 'h1\tu\tclient\t-\tlab\tAA\t2026-01-01\n' > lab/inventory.txt
+  run_cmd "$LAB" --forget h1 --lab-dir ./lab
+  assert_rc 1
+  assert_contains "ERROR: another CA_Lab run is using $PWD/lab (4242 otherbox); if no run is active: rm -r $PWD/lab/.lock"
+  [[ -d lab/.lock ]] || fail "the other run's lock was removed"
+}
+
+test_lab_forget_drops_host_with_warning() {
+  make_lab || return 1
+  printf 'h1\tu\tclient\t-\tlab\tAA\t2026-01-01\nH2\tu\tnode\tqcore:installed\tlab\tAA\t2026-01-01\n' > lab/inventory.txt
+  run_cmd "$LAB" --forget h2 --lab-dir ./lab
+  assert_rc 0
+  assert_contains "WARNING: H2 was not cleaned; if it still exists it may still trust this lab"
+  assert_eq "$(cut -f1 lab/inventory.txt)" "h1" "inventory hosts"
+  [[ ! -d lab/.lock ]] || fail "lock left behind"
+}
+
+test_lab_remove_needs_inventory_and_own_keys() {
+  make_lab || return 1
+  run_cmd "$LAB" --remove --lab-dir ./lab
+  assert_rc 1
+  assert_contains "ERROR: no inventory at $PWD/lab/inventory.txt"
+  printf 'h1\tu\tclient\t-\town:/home/u/.ssh/id_lab\tAA\t2026-01-01\n' > lab/inventory.txt
+  run_cmd "$LAB" --remove --lab-dir ./lab
+  assert_rc 1
+  assert_contains "ERROR: --remove needs --ssh-key for h1 (was /home/u/.ssh/id_lab)"
+}
+
+test_lab_remove_dry_run_lists_and_takes_no_lock() {
+  make_lab || return 1
+  printf 'h1\tu\tnode\tqcore:installed\tlab\tAA,BB\t2026-01-01\n' > lab/inventory.txt
+  local before
+  before="$(tree_state lab)"
+  run_cmd "$LAB" --remove --lab-dir ./lab --dry-run
+  assert_rc 0
+  assert_contains "Would remove from u@h1: roots AA BB (and container qcore); then the lab key"
+  assert_eq "$(tree_state lab)" "$before" "lab folder after --remove --dry-run"
 }
 
 run_test() {
