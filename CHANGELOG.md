@@ -33,3 +33,33 @@
   `WARNING: replacing a different lab's root on <host>`.
 - The remote root script detaches its stdin first, so the sudo password line
   can never be read by a later command.
+
+### CA_Faker.sh
+
+- The chain is now root CA -> intermediate CA -> server cert, and
+  `certbundle.pem` holds all three (leaf, intermediate, root). New files:
+  `ca/intermediate.crt.pem`, `ca/intermediate.key.pem` and the serial files
+  `ca/ca.crt.srl`, `ca/intermediate.crt.srl`.
+- The root and intermediate carry `keyUsage = critical, keyCertSign, cRLSign`
+  (strict clients such as Python 3.13+ rejected the old root). Every cert
+  carries explicit Subject/Authority Key Identifiers, so OpenSSL 1.1.1 and
+  3.x produce the same chain.
+- Root and intermediate names carry a timestamp
+  (`Company Lab Root CA <YYYYMMDD-HHMMSS>`), so every lab root is unique.
+- What is rebuilt is a strict cascade: a new root forces a new intermediate,
+  a new intermediate or server key forces a new server cert, and the CSR is
+  always regenerated with the server cert (a new key or `--cn` can no longer
+  be paired with an old CSR).
+- Reruns work as a normal user: every file is removed before it is
+  rewritten (before, the 444/400 files caused `Permission denied`).
+- A reused server cert prints one fixed line saying your `--cn`/`--san`
+  were not applied and how to apply them.
+- After generation the script proves what it ships: chain, purpose and every
+  name in the cert (`openssl verify -x509_strict -purpose sslserver
+  -trusted`), keyUsage / key identifiers, that the server key matches the
+  cert, and the bundle order. `certbundle.pem` is published only after all
+  checks pass; on failure the previous bundle is left untouched.
+- An out-dir whose root lacks keyUsage (made by an older CA_Faker) is
+  refused: `ERROR: Existing Root CA at ... is missing keyUsage`.
+- `READY.` lists what was created or reused, read from the certs (CN,
+  expiry, root SHA-256 and SHA-1), the names covered, and the next commands.
