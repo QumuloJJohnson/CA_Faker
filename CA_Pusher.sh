@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# push_ca_trust_to_clusterB_ubuntu.sh
+# push_ca_trust_to_clusterB.sh
 #
 # Run this on Cluster A.
 #
@@ -14,7 +14,7 @@
 #   3) prompts for SSH auth method (key or password)
 #   4) prompts for the remote sudo password (or reads it from stdin with
 #      --sudo-password-stdin; empty = passwordless sudo, checked per host)
-#   5) copies the CA cert to each client
+#   5) sends the CA cert to each client (embedded in the remote script)
 #   6) installs it into the system trust store: Ubuntu/Debian
 #      (/usr/local/share/ca-certificates, update-ca-certificates) or
 #      RHEL/Rocky/Alma (/etc/pki/ca-trust/source/anchors, update-ca-trust)
@@ -603,23 +603,35 @@ trust_install() {
 # prove the refreshed system bundle parses and holds none of them. A failing
 # `openssl verify` is not proof (an empty bundle or an expired root fail it
 # too), so every cert in the bundle is fingerprinted instead.
+# Prints every regular file under $1, hidden ones included. Plain sh, like the
+# rest of what runs in a container: no globstar, and minimal images lack find.
+list_files() {
+  local p
+  for p in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    if [ -d "$p" ] && [ ! -L "$p" ]; then
+      list_files "$p"
+    elif [ -f "$p" ]; then
+      printf '%s\n' "$p"
+    fi
+  done
+}
+
 trust_remove() {
   local label="$1" where="$2" roots="$3"
-  local refresh f n fp c chunks hit total=0 bad=0
+  local refresh f n fp c chunks hit files total=0 bad=0
   trust_family "$label" "$where" || return 1
   refresh="$TS_REFRESH"
   [ "$refresh" = "update-ca-certificates" ] && refresh="update-ca-certificates --fresh"
-  # dotglob: hidden anchor files must be scanned too, like find -type f.
-  shopt -s globstar nullglob dotglob
-  for f in "$TS_DIR"/**; do
-    [ -f "$f" ] || continue
+  files="$(mktemp)" || return 1
+  list_files "$TS_DIR" > "$files"
+  while IFS= read -r f; do
     n="$(grep -c 'BEGIN CERTIFICATE' "$f" 2>/dev/null || true)"
     [ "${n:-0}" -ge 1 ] || continue
     if [ "$n" -eq 1 ]; then
       fp="$(fp_of "$f")"
       [ -n "$fp" ] || continue
       case " $roots " in
-        *" $fp "*) rm -f "$f" || return 1; echo "Removed: $f" ;;
+        *" $fp "*) rm -f "$f" || { rm -f "$files"; return 1; }; echo "Removed: $f" ;;
       esac
     else
       # Never edit a multi-cert file: name it and fail.
@@ -636,7 +648,8 @@ trust_remove() {
         bad=1
       fi
     fi
-  done
+  done < "$files"
+  rm -f "$files"
   $refresh >/dev/null || { echo "ERROR: $refresh failed on $where" >&2; return 1; }
   if [ ! -s "$TS_BUNDLE" ]; then
     echo "ERROR: $TS_BUNDLE is missing or empty on $where" >&2
@@ -673,14 +686,13 @@ trust_remove() {
 # with -servername and -verify_hostname.
 tls_check() {
   local ep="$1" h out
-  local -a name_opts
   h="${ep%:*}"; h="${h#[}"; h="${h%]}"
-  if [[ "$h" == *:* || "$h" =~ ^[0-9.]+$ ]]; then
-    name_opts=(-verify_ip "$h")
-  else
-    name_opts=(-servername "$h" -verify_hostname "$h")
-  fi
-  if out=$(echo | timeout 15 openssl s_client -connect "$ep" "${name_opts[@]}" -verify_return_error -brief 2>&1); then
+  case "$h" in
+    *:*) set -- -verify_ip "$h" ;;
+    *[!0-9.]*) set -- -servername "$h" -verify_hostname "$h" ;;
+    *) set -- -verify_ip "$h" ;;
+  esac
+  if out=$(echo | timeout 15 openssl s_client -connect "$ep" "$@" -verify_return_error -brief 2>&1); then
     printf '%s\n' "$out" | sed -n '1,3p'
     return 0
   fi
@@ -712,7 +724,7 @@ if [ "$MODE" = "remove" ]; then
     echo ""
     echo "Removing lab roots from nspawn container: $CONTAINER"
     if LEADER="$(container_leader)" && [ -n "$LEADER" ] \
-        && nsenter -t "$LEADER" -m -p -u -- bash -c "$(declare -f fp_of trust_family trust_remove); trust_remove \"\$@\"" _ \
+        && nsenter -t "$LEADER" -m -p -u -- sh -c "$(declare -f fp_of trust_family list_files trust_remove); trust_remove \"\$@\"" _ \
           "Container $CONTAINER trust store" "container $CONTAINER" "$REMOVE_ROOTS"; then
       echo "RESULT $HOST container $CONTAINER trust REMOVED"
     else
@@ -750,7 +762,7 @@ if [ -n "$CONTAINER" ]; then
   echo "Installing CA cert into nspawn container: $CONTAINER"
   if ! LEADER="$(container_leader)" || [ -z "$LEADER" ]; then
     CSTATE="SKIPPED"
-  elif nsenter -t "$LEADER" -m -p -u -- bash -c "$(declare -f fp_of trust_family trust_install); trust_install \"\$@\"" _ \
+  elif nsenter -t "$LEADER" -m -p -u -- sh -c "$(declare -f fp_of trust_family trust_install); trust_install \"\$@\"" _ \
       "Container $CONTAINER trust store" "container $CONTAINER" "$TRUST_NAME" "$VERIFY_TRUST" "" < "$CERT"; then
     if [ "$VERIFY_TRUST" = 1 ]; then CSTATE="OK"; else CSTATE="NOT-VERIFIED"; fi
   else
@@ -766,7 +778,7 @@ for EP in $VERIFY_TLS_EPS; do
   [ "$CSTATE" = "OK" ] || [ "$CSTATE" = "NOT-VERIFIED" ] || continue
   echo ""
   echo "TLS verify (container $CONTAINER -> $EP):"
-  if nsenter -t "$LEADER" -m -p -u -n -- bash -c "$(declare -f tls_check); tls_check \"\$1\"" _ "$EP"; then
+  if nsenter -t "$LEADER" -m -p -u -n -- sh -c "$(declare -f tls_check); tls_check \"\$1\"" _ "$EP"; then
     echo "TLS OK (container $CONTAINER): chain and name validated for $EP"
     echo "RESULT $HOST tls container $CONTAINER $EP OK"
   else

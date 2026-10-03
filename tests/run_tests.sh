@@ -615,6 +615,48 @@ test_faker_issues_and_self_checks_ip_wildcard_and_ipv6_names() {
   assert_eq "$sans" "DNS:stratusdatacore.qumulotest.local, DNS:*.qumulotest.local, IP Address:10.1.1.10, IP Address:2001:DB8:0:0:0:0:0:10" "leaf SANs"
 }
 
+# Everything CA_Pusher runs inside a container must work under plain sh: the
+# container may be a different distro and may not have bash.
+container_fns() {
+  bash -c 'eval "$(sed -n "/^fp_of() {/,/^}/p;/^trust_family() {/,/^}/p;/^trust_install() {/,/^}/p;/^list_files() {/,/^}/p;/^trust_remove() {/,/^}/p;/^tls_check() {/,/^}/p" "$1")"; declare -f fp_of trust_family trust_install list_files trust_remove tls_check' _ "$PUSHER" > fns.sh
+}
+
+test_container_functions_parse_under_posix_sh() {
+  command -v dash >/dev/null 2>&1 || { skip "dash not installed"; return 0; }
+  container_fns
+  grep -q '^list_files ()' fns.sh || fail "list_files not found in CA_Pusher.sh"
+  run_cmd dash -n fns.sh
+  assert_rc 0
+  grep -n -- '-- bash -c' "$PUSHER" && fail "a container step still runs bash"
+  return 0
+}
+
+test_container_list_files_walks_nested_and_hidden_under_sh() {
+  command -v dash >/dev/null 2>&1 || { skip "dash not installed"; return 0; }
+  container_fns
+  mkdir -p anchors/sub/deeper
+  : > anchors/a.crt; : > anchors/.hidden.crt; : > anchors/sub/b.crt; : > anchors/sub/deeper/..odd.crt
+  run_cmd dash -c '. ./fns.sh; list_files "$1"' _ "$PWD/anchors"
+  assert_rc 0
+  assert_eq "$(sort <<< "$STDOUT" | sed "s#$PWD/anchors/##")" $'.hidden.crt\na.crt\nsub/b.crt\nsub/deeper/..odd.crt' "files found"
+}
+
+test_container_tls_check_works_under_sh() {
+  command -v dash >/dev/null 2>&1 || { skip "dash not installed"; return 0; }
+  faker_outdir od || return 1
+  run_cmd "$FAKER" --cn other.lab.test --san "dns:other.lab.test,ip:127.0.0.1" --out-dir ./od --force-reissue
+  assert_rc 0
+  container_fns
+  mkdir -p empty_ca_dir
+  start_tls_server od || return 1
+  run_cmd env SSL_CERT_FILE=od/ca/ca.crt.pem SSL_CERT_DIR="$PWD/empty_ca_dir" dash -c '. ./fns.sh; tls_check "$1"' _ "127.0.0.1:$SERVER_PORT"
+  assert_rc 0
+  run_cmd env SSL_CERT_FILE=od/ca/ca.crt.pem SSL_CERT_DIR="$PWD/empty_ca_dir" dash -c '. ./fns.sh; tls_check "$1"' _ "localhost:$SERVER_PORT"
+  assert_rc 1
+  [[ "${OUT,,}" == *"hostname mismatch"* ]] || { fail "expected a hostname mismatch"; show_out; }
+  stop_tls_server
+}
+
 test_versions_report_2_0_0() {
   run_cmd "$FAKER" --version
   assert_rc 0
@@ -828,6 +870,14 @@ test_faker_rebuilt_ca_dir_fails_with_hint_and_keeps_bundle() {
   run_cmd "$FAKER" --cn a.qumulotest.local --out-dir ./a --ca-dir ./lab --force-reissue
   assert_rc 0
   assert_eq "$(fp a/ca/ca.crt.pem)" "$(fp lab/ca.crt.pem)" "a root after reissue"
+}
+
+# With a shared lab CA two folders hold secrets; the warning names both.
+test_ready_warning_names_both_secret_folders() {
+  shared_lab || return 1
+  run_cmd "$FAKER" --cn a.qumulotest.local --out-dir ./a --ca-dir ./lab
+  assert_rc 0
+  assert_contains "WARNING: anyone with ./a and ./lab can issue certs your machines will trust. Keep them"
 }
 
 test_faker_old_root_in_ca_dir_is_refused_unless_key_missing() {

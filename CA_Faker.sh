@@ -499,13 +499,17 @@ self_check() {
 
 print_ready() {
   local ca_crt="$1" ca_state="$2" int_crt="$3" int_state="$4" server_crt="$5" leaf_state="$6"
-  local certbundle="$7" server_key="$8" leaf_text sans suggest secret
+  local certbundle="$7" server_key="$8" leaf_text sans suggest secret it
   leaf_text="$(openssl x509 -in "$server_crt" -noout -text)"
   sans="$(sans_from_text "$leaf_text")"
   suggest="$(cert_cn "$server_crt")"
   [[ "$suggest" == '*'* ]] && suggest="<your-cluster>"
   secret="$OUT_DIR"
-  [[ "$(dirname "$ca_crt")" -ef "$OUT_DIR/ca" ]] || secret="$OUT_DIR and $(dirname "$ca_crt")"
+  it="it"
+  if ! [[ "$(dirname "$ca_crt")" -ef "$OUT_DIR/ca" ]]; then
+    secret="$OUT_DIR and $(dirname "$ca_crt")"
+    it="them"
+  fi
 
   cat <<EOF
 
@@ -545,9 +549,9 @@ Next steps:
   3. Desktops/browsers: see README step 5 — you will need the root CN and
      SHA-1 above.
 
-WARNING: anyone with $secret can issue certs your machines will trust. Keep it
+WARNING: anyone with $secret can issue certs your machines will trust. Keep $it
 secret; when the lab ends, remove the root (README "Cleaning up after the lab")
-and delete it.
+and delete $it.
 
 EOF
 }

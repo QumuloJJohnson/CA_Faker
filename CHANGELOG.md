@@ -8,10 +8,10 @@ warnings. There's also a new script, `CA_Lab.sh`, that sets up a whole lab in
 one go.
 
 This release builds on Joe Costa's Rocky 9.3 update, which added Rocky/RHEL
-trust stores to CA_Pusher (with `restorecon` and container support), checks
-the hostname and requires a port in `--verify-tls`, counts a host as failed
-when its install fails, and moved "apply TLS" before "push the CA" in the
-Quick Start.
+trust stores to CA_Pusher (with `restorecon`, and per container, since a
+container may run a different distro than its host), checks the hostname and
+requires a port in `--verify-tls`, counts a host as failed when its install
+fails, and moved "apply TLS" before "push the CA" in the Quick Start.
 
 ### New
 
