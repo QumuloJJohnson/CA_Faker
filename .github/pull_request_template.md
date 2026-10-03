@@ -1,3 +1,9 @@
+<!--
+Write this for a person, the way you'd explain the change to a teammate:
+short sentences, plain words, no marketing language, no filler. Bullets for
+lists, not for every sentence. If a section doesn't apply, write "None".
+-->
+
 ## Summary
 
 <!--
