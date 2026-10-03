@@ -98,12 +98,12 @@ Usage: $0 --clients <file> --ca <ca-tool-out-dir> [options]
 
 Required:
   --clients <file>        File with one client IP/hostname/FQDN per line
-  --ca <dir>              Directory created by CA creation tool (e.g. /root/qumulo-tls)
+  --ca <dir>              Out-dir from CA_Faker.sh (e.g. /root/qumulo-tls)
                           CA cert is expected at: <dir>/ca/ca.crt.pem
                           (or <dir>/ca.crt.pem, e.g. a CA_Faker --ca-dir)
 
 Optional:
-  --ssh-user <name>           SSH username (if omitted, will prompt)
+  --ssh-user <name>       SSH username (if omitted, will prompt)
   --port <n>              SSH port (default: $SSH_PORT)
   --auth key              Use SSH key auth
   --auth password         Use password SSH auth (requires sshpass)
@@ -113,7 +113,7 @@ Optional:
                           container's own trust store tools. A host without
                           machinectl or without that running container gets a
                           WARNING and the container is skipped.
-  --verify-tls <h:p>     End-to-end TLS check against host:port after install,
+  --verify-tls <h:p>      End-to-end TLS check against host:port after install,
                           from the host and the container. The chain AND the
                           name (or IP) are checked. The port is required; put
                           IPv6 in brackets. May be given more than once; every

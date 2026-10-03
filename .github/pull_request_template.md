@@ -36,7 +36,7 @@ output files, messages, exit codes, README step order. Say whether today's
 commands still work the same way. Write "None" if there are none.
 -->
 
-- [ ] `CHANGELOG.md` updated (and "Upgrading from 1.x" if existing users must act)
+- [ ] `CHANGELOG.md` updated (and "Upgrading from the old scripts" if existing users must act)
 - [ ] Every new or changed flag is in the script's `--help` and in the README tables
 
 ## How it was tested

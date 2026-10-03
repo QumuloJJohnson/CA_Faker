@@ -1042,7 +1042,7 @@ print_lab_footer() {
   echo "Cleanup: ./CA_Lab.sh --remove --lab-dir $LAB_ABS (README \"Cleaning up after the lab\")${comment:+; lab key comment in authorized_keys: $comment}"
   echo "Lab folder: $LAB_ABS"
   [[ -n "$LOG_FILE" ]] && echo "Log: $LOG_FILE"
-  echo "WARNING: this root can sign certs for ANY site — keep $LAB_ABS secret and remove the root when the lab ends."
+  echo "WARNING: anyone with $LAB_ABS can issue certs your machines will trust. Keep it secret; when the lab ends, run --remove and delete it."
 }
 
 # --remove, step for one host: drop the lab key from authorized_keys, then

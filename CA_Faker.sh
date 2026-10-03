@@ -255,7 +255,7 @@ is_dns_name() {
 
 check_dns_name() {
   is_dns_name "$1" && return 0
-  err "$1 is not a valid DNS name (letters, digits and '-' only, dot-separated; use xn-- punycode for international names; all-number names are read as IP addresses by browsers)"
+  err "$1 is not a valid DNS name (letters, digits, '-' and '_' only, dot-separated; use xn-- punycode for international names; all-number names are read as IP addresses by browsers)"
   exit 1
 }
 
@@ -511,7 +511,7 @@ print_ready() {
 
 READY.
 
-Built this run (created) or kept from an earlier run (reused):
+CA and cert (created this run, or reused):
   Root CA:          $ca_state  $ca_crt
                     CN: $(cert_cn "$ca_crt")
                     expires: $(cert_enddate "$ca_crt")
@@ -545,9 +545,9 @@ Next steps:
   3. Desktops/browsers: see README step 5 — you will need the root CN and
      SHA-1 above.
 
-WARNING: this root can sign certs for ANY site — keep $secret secret and remove the root when the lab ends.
-When the lab is gone, delete $secret — anyone with ca/*.key.pem can issue certs your machines will trust.
-See README "Cleaning up after the lab".
+WARNING: anyone with $secret can issue certs your machines will trust. Keep it
+secret; when the lab ends, remove the root (README "Cleaning up after the lab")
+and delete it.
 
 EOF
 }

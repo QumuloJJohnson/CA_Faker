@@ -9,9 +9,9 @@ certificate properly (chain AND hostname) with no warnings and no `-k`.
 
 ## How It Works
 
-Both scripts run from any admin machine (your laptop on Linux, WSL, or macOS
-with Homebrew bash and OpenSSL; a jump box, etc.) —
-nothing needs to run on a Qumulo node.
+CA_Faker and CA_Pusher run from any admin machine (your laptop on Linux, WSL,
+or macOS with Homebrew bash and OpenSSL; a jump box, etc.); CA_Lab needs Linux
+or WSL. Nothing needs to run on a Qumulo node.
 
 1. **CA_Faker.sh** generates a root CA, an intermediate CA and a server
    certificate locally (chain: root -> intermediate -> server).
@@ -32,7 +32,7 @@ Terms used below:
   `./lab-tls`): the lab CA, one out-dir per cluster, the lab SSH key, the
   inventory and the logs.
 
-See [CHANGELOG.md](CHANGELOG.md), including **Upgrading from 1.x**.
+See [CHANGELOG.md](CHANGELOG.md), including **Upgrading from the old scripts**.
 
 ## Requirements
 
@@ -126,14 +126,16 @@ Needs a Linux or WSL admin machine with `qq`, `ssh`, `ssh-keygen`,
 5. Trust the lab on admin desktops per step 5 below (the summary prints the
    root CN and SHA-1).
 
-What one run does, in order: checks both files and every name (nothing is
-changed if anything is wrong); creates the lab SSH key once and pushes it to
-machines that do not have it yet; issues a cert for every cluster from the lab
-CA (reissued automatically when the cluster's line or the lab CA changed);
-applies it with `qq` unless the cluster already serves it, then waits until
-it is served; installs the lab root on every machine and its container and
-checks that each one validates every cluster on port 443 (fixed); and finally
-checks every name in each cert from the admin machine.
+What one run does, in order:
+
+1. Checks both files and every name. If anything is wrong, nothing changes.
+2. Creates the lab SSH key once and pushes it where it's missing.
+3. Issues a cert for each cluster (reissued if its line or the lab CA changed).
+4. Applies it with `qq` unless the cluster already serves it, and waits until
+   it does.
+5. Installs the lab root on every machine and container, and checks each one
+   can reach every cluster on port 443.
+6. Checks every name in each cert from the admin machine.
 
 | Flag | Description |
 |------|-------------|
@@ -144,7 +146,7 @@ checks every name in each cert from the admin machine.
 | `--container <name>` | Container on `clients.txt` hosts (default: none, as CA_Pusher) |
 | `--lab-dir <path>` | Lab folder (default `./lab-tls`) |
 | `--qq-user <name>` | Qumulo admin user (default `admin`) |
-| `--port <n>`, `--timeout <sec>` | SSH port and connect timeout |
+| `--port <n>`, `--timeout <sec>` | SSH port (default 22) and connect timeout (default 8) |
 | `--ssh-key <path>` | Use an existing unencrypted key (mode 600) instead of the lab key; no key push |
 | `--new-lab` | Allow creating a new lab CA when there is no TTY to confirm it |
 | `--dry-run` | Show the checks, targets and which clusters would be (re)issued; change nothing |
@@ -257,13 +259,14 @@ If the cluster isn't serving the new certificate yet, omit `--verify-tls`.
 
 A node is counted as OK only if the install, the trust check (unless
 `--no-verify`) and the `--verify-tls` handshakes (if given) all succeed.
-`--verify-tls` needs an explicit port and checks the chain AND the name: the
-name you give must be one the server certificate covers (use the same name as
-`--cn`/`--san` in CA_Faker.sh), and should resolve the same on every node (and
-inside the container), or be an IP that is in the cert. If only the container
-check fails while the host check passes, look at the container's DNS/network:
-in `qcore`, networking (including DNS) is configured inside the container, not
-on the host.
+
+`--verify-tls` needs a port and checks the chain and the name. Use a name from
+`--cn`/`--san` that resolves the same on every node and in the container, or an
+IP that is in the cert.
+
+If only the container check fails while the host check passes, look at the
+container's DNS/network: in `qcore`, networking (including DNS) is configured
+inside the container, not on the host.
 
 The script exits `2` and lists the failed nodes if any node fails.
 
@@ -271,17 +274,21 @@ The script exits `2` and lists the failed nodes if any node fails.
 ### 5. Trust the CA on admin desktops (browsers)
 
 Run these on each desktop whose browser should open the cluster without a
-warning. `ca.crt.pem` is `<out-dir>/ca/ca.crt.pem` (`ca/ca.cer` is the same
-cert in DER form, for double-click import). `<SHA-1>` and `<root CN>` are
+warning. `ca.crt.pem` is `<out-dir>/ca/ca.crt.pem` (with CA_Lab:
+`<lab-dir>/ca/ca.crt.pem`); `ca/ca.cer` next to it is the same cert in DER
+form, for double-click import. `<SHA-1>` and `<root CN>` are
 printed by CA_Faker's `READY.` output. Restart the browser after installing.
 
 | Desktop | Install | Remove | Browsers covered |
 |---------|---------|--------|------------------|
 | Windows (admin prompt) | `certutil -addstore -f Root ca.crt.pem` | `certutil -delstore Root <SHA-1>` | Chrome, Edge; Firefox 120+ (imports OS roots by default) |
-| macOS (local Terminal; macOS 11+ asks for GUI authorization) | `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ca.crt.pem` | `sudo security remove-trusted-cert -d ca.crt.pem` then `sudo security delete-certificate -Z <SHA-1> /Library/Keychains/System.keychain` | Safari, Chrome, Edge; Firefox 120+ |
+| macOS (local Terminal; macOS 11+ asks for GUI authorization) | `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ca.crt.pem` | see below the table | Safari, Chrome, Edge; Firefox 120+ |
 | Ubuntu desktop, Chrome/Edge | `mkdir -p ~/.pki/nssdb && certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "<root CN>" -i ca.crt.pem` (needs `libnss3-tools`; snap Chromium: `~/snap/chromium/current/.pki/nssdb`) | `certutil -d sql:$HOME/.pki/nssdb -D -n "<root CN>"` | Chrome, Edge, Chromium |
 | Ubuntu desktop, Firefox | Settings → Privacy & Security → Certificates → View Certificates → Authorities → Import | same dialog → Delete | Firefox |
 | RHEL/Fedora desktop | node commands (`update-ca-trust`, see [Cleaning up](#cleaning-up-after-the-lab) for the path) **and** the nssdb command for Chrome/Edge | reverse both | Firefox, system tools; Chrome/Edge via nssdb |
+
+macOS remove: `sudo security remove-trusted-cert -d ca.crt.pem`, then
+`sudo security delete-certificate -Z <SHA-1> /Library/Keychains/System.keychain`.
 
 Per-user alternatives (preferred where they work for you): Windows
 `certutil -user -addstore Root ca.crt.pem` (remove: `certutil -user -delstore Root <SHA-1>`);
@@ -296,6 +303,7 @@ Do this in order when the lab is gone:
 1. If the `READY.` output is gone, re-print the root's CN and SHA-1:
    ```bash
    openssl x509 -in <out-dir>/ca/ca.crt.pem -noout -subject -fingerprint -sha1
+   # with CA_Lab: <lab-dir>/ca/ca.crt.pem
    ```
 2. Desktops: remove the root per the table in step 5.
 3. Nodes and their containers: remove the file and refresh the trust store.
@@ -346,7 +354,7 @@ with `--force-reissue` and re-apply and re-push.
 | Flag | Description |
 |------|-------------|
 | `--clients <file>` | **(required)** File with target hostnames/IPs |
-| `--ca <dir>` | **(required)** Output directory from CA_Faker.sh (a server's out-dir; a dir holding `ca.crt.pem` itself, such as a `--ca-dir`, also works) |
+| `--ca <dir>` | **(required** unless `--remove`**)** Output directory from CA_Faker.sh (a server's out-dir; a dir holding `ca.crt.pem` itself, such as a `--ca-dir`, also works) |
 | `--ssh-user <name>` | SSH username (prompts if omitted) |
 | `--auth key\|password` | SSH auth method (prompts if omitted; `password` requires sshpass) |
 | `--key <path>` | SSH private key path |
@@ -402,7 +410,7 @@ is informational (a different root was overwritten).
 
 | Script | 0 | 1 | 2 |
 |--------|---|---|---|
-| CA_Faker.sh | everything built and proven | error, nothing published | — |
+| CA_Faker.sh | everything built and checked | error; `certbundle.pem` not written or changed | — |
 | CA_Pusher.sh | every host done | bad arguments or input (nothing pushed) | one or more hosts failed |
 | CA_Lab.sh | everything listed done and proven | bad input or setup error (no cluster or trust store changed) | something not done or not proven (see `Not done:`) |
 
@@ -420,6 +428,7 @@ is informational (a different root was overwritten).
   ca/ca.srl, ca/intermediate.srl  # Serial number files
   issued/server.crt.pem  # Server leaf cert
   csr/server.csr.pem     # Certificate signing request
+  tmp/                   # Working files, safe to delete
 ```
 
 With `--ca-dir`, the CA keys, certs and serial files live in the ca-dir; the

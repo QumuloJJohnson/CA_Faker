@@ -333,7 +333,8 @@ test_faker_ready_reports_values_read_from_certs() {
   [[ "$STDOUT" =~ SHA-1:\ +[0-9A-F]{40} ]] || fail "READY does not print a 40-hex SHA-1"
   assert_contains $'Names covered by the server cert:\n  dns:stratusdatacore.qumulotest.local'
   [[ "$STDOUT" != *other.qumulotest.local* ]] || fail "READY shows the requested SAN, not the cert's"
-  assert_contains "WARNING: this root can sign certs for ANY site"
+  assert_contains "WARNING: anyone with ./od can issue certs your machines will trust."
+  assert_eq "$(grep -c '^WARNING:' <<< "$STDOUT")" 1 "warnings in READY"
 }
 
 test_faker_force_reissue_rebuilds_leaf_side_only() {
@@ -595,7 +596,7 @@ test_names_specific_messages() {
   check_names --cn x.lab.test --san dns:10.0.0.1
   assert_contains "ERROR: dns:10.0.0.1 is an IP address; use ip:10.0.0.1"
   check_names --cn x.lab.test --san dns:1.2.3
-  assert_contains "ERROR: 1.2.3 is not a valid DNS name (letters, digits and '-' only, dot-separated; use xn-- punycode for international names; all-number names are read as IP addresses by browsers)"
+  assert_contains "ERROR: 1.2.3 is not a valid DNS name (letters, digits, '-' and '_' only, dot-separated; use xn-- punycode for international names; all-number names are read as IP addresses by browsers)"
 }
 
 test_faker_server_days_over_825_warns() {
@@ -845,6 +846,16 @@ test_faker_old_root_in_ca_dir_is_refused_unless_key_missing() {
   run_cmd "$FAKER" --cn a.qumulotest.local --out-dir ./a --ca-dir ./lab
   assert_rc 0
   [[ "$(openssl x509 -in lab/ca.crt.pem -noout -text)" == *"X509v3 Key Usage"* ]] || fail "root was not rebuilt"
+}
+
+# Option descriptions in each script's --help start in one column.
+test_help_options_line_up() {
+  local script cols
+  for script in CA_Faker.sh CA_Pusher.sh CA_Lab.sh; do
+    # Width of "  --flag [arg]" plus its padding = the description column.
+    cols="$("$REPO/$script" --help 2>&1 | awk 'match($0, /^  --[^ ]+( [^ ]+)?  +/) { print RLENGTH }' | sort -u)"
+    [[ "$(wc -l <<< "$cols")" -eq 1 ]] || fail "$script --help options start in columns: $(echo $cols)"
+  done
 }
 
 # Every flag in a script's --help must be documented in its README table.
