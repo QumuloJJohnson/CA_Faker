@@ -15,9 +15,10 @@ nothing needs to run on a Qumulo node.
 
 1. **CA_Faker.sh** generates a root CA, an intermediate CA and a server
    certificate locally (chain: root -> intermediate -> server).
-2. **CA_Pusher.sh** SSHes into each client node and installs the CA cert into
-   the host's trust store (and optionally into a systemd-nspawn container).
-3. You apply the server certificate to the Qumulo cluster via `qq` CLI.
+2. You apply the server certificate to the Qumulo cluster via `qq` CLI.
+3. **CA_Pusher.sh** SSHes into each client node and installs the CA cert into
+   the host's trust store (and optionally into a systemd-nspawn container),
+   then can verify TLS against the cluster configured in step 2.
 
 Qumulo replication and portals use each cluster's own built-in identity
 certificates; CA_Faker does not change or need to change them.
@@ -41,13 +42,30 @@ Admin machine (where you run the scripts):
   `PATH="$(brew --prefix openssl@3)/bin:$PATH" bash ./CA_Faker.sh ...`
   (stock macOS bash and LibreSSL are refused with that hint)
 - sshpass (only if using password-based SSH auth)
+  - Ubuntu/Debian: `sudo apt-get install -y sshpass`
+  - Rocky/RHEL: `sudo dnf install -y epel-release && sudo dnf install -y sshpass`
 
 Remote nodes (targets of CA_Pusher.sh):
-- **Ubuntu/Debian or RHEL/Rocky/Alma target machine** with a sudo-capable SSH user
-- `openssl` on each node, and inside each container
+- An SSH user that can `sudo` (with a password, or passwordless sudo)
+- `openssl` on each node, and inside each container, plus one of the
+  supported trust stores. CA_Pusher detects which one each host (and each
+  container) has:
+
+  | Distro family | CA installed at | Refreshed with |
+  |---------------|-----------------|----------------|
+  | Ubuntu / Debian | `/usr/local/share/ca-certificates/company-lab-root-ca.crt` | `update-ca-certificates` |
+  | Rocky / RHEL / Alma / Fedora | `/etc/pki/ca-trust/source/anchors/company-lab-root-ca.crt` | `update-ca-trust extract` |
+
 - Other Linux distros and OSes are not supported as targets
-- Optional: systemd-nspawn container (e.g. `qcore`); the host needs
-  `machinectl` (package `systemd-container`)
+- Optional: systemd-nspawn container (e.g. `qcore`); it may run a different
+  distro than its host. The host needs `machinectl` (package
+  `systemd-container`)
+
+> **Apps with their own TLS library (e.g. wolfSSL):** CA_Pusher puts the CA in
+> the OS trust store. Apps built on OpenSSL/GnuTLS read that automatically, but
+> a wolfSSL app only uses it if it loads the system CAs
+> (`wolfSSL_CTX_load_system_CA_certs()`, wolfSSL built with system CA support,
+> the default) — otherwise point the app at `ca/ca.crt.pem` directly.
 
 ## Keep the lab CA secret
 
@@ -189,30 +207,9 @@ node2.lab.example.com
 node3.lab.example.com
 ```
 
-### 3. Push CA to remote nodes (run on your admin machine)
+### 3. Apply TLS to Qumulo
 
-Push the CA cert to each node and its `qcore` nspawn container, then verify
-that TLS works end-to-end:
-
-```bash
-./CA_Pusher.sh \
-  --clients clients.txt \
-  --ca ./qumulo-tls \
-  --ssh-user admin \
-  --auth key \
-  --container qcore \
-  --verify-tls myserver.lab.example.com:443
-```
-
-If your nodes do not run nspawn containers, omit `--container`.
-`--verify-tls` checks the cluster after its cert is applied (step 4); on a
-first run omit it, then rerun step 3 with it after step 4 to confirm end to
-end. It checks the chain AND the name: use an FQDN that resolves the same on
-every node (and inside the container), or an IP that is in the cert.
-
-### 4. Apply TLS to Qumulo
-
-From your admin machine (where CA_Faker.sh was run, assumign the `qq` CLI is available - This is the easiest method):
+From your admin machine (where CA_Faker.sh was run, assuming the `qq` CLI is available - This is the easiest method):
 
 ```bash
 qq --host your.qumulo.cluster.com login -u admin
@@ -221,10 +218,8 @@ qq --host your.qumulo.cluster.com ssl_modify_certificate \
   -k ./qumulo-tls/private.key.insecure
 ```
 
-Or from inside a `qcore` container. CA_Pusher installs the CA cert at
-`/usr/local/share/ca-certificates/company-lab-root-ca.crt` (Ubuntu/Debian) or
-`/etc/pki/ca-trust/source/anchors/company-lab-root-ca.crt` (RHEL family), but
-the certbundle and private key must be copied separately:
+Or from inside a `qcore` container. Copy the certbundle and private key in
+first (the CA cert itself is installed by CA_Pusher in step 4):
 
 ```bash
 # From your admin machine, copy the files into the container via the host:
@@ -241,6 +236,37 @@ qq ssl_modify_certificate \
   -c /tmp/certbundle.pem \
   -k /tmp/private.key.insecure
 ```
+
+### 4. Push CA to remote nodes (run on your admin machine)
+
+Push the CA cert to each node and its `qcore` nspawn container, then verify
+that TLS works end-to-end against the cluster you configured in step 3:
+
+```bash
+./CA_Pusher.sh \
+  --clients clients.txt \
+  --ca ./qumulo-tls \
+  --ssh-user admin \
+  --auth key \
+  --container qcore \
+  --verify-tls myserver.lab.example.com:443
+```
+
+If your nodes do not run nspawn containers, omit `--container`.
+If the cluster isn't serving the new certificate yet, omit `--verify-tls`.
+
+A node is counted as OK only if the install, the trust check (unless
+`--no-verify`) and the `--verify-tls` handshakes (if given) all succeed.
+`--verify-tls` needs an explicit port and checks the chain AND the name: the
+name you give must be one the server certificate covers (use the same name as
+`--cn`/`--san` in CA_Faker.sh), and should resolve the same on every node (and
+inside the container), or be an IP that is in the cert. If only the container
+check fails while the host check passes, look at the container's DNS/network:
+in `qcore`, networking (including DNS) is configured inside the container, not
+on the host.
+
+The script exits `2` and lists the failed nodes if any node fails.
+
 
 ### 5. Trust the CA on admin desktops (browsers)
 
@@ -391,7 +417,7 @@ is informational (a different root was overwritten).
   ca/ca.key.pem          # Root CA key (protect this)
   ca/intermediate.crt.pem  # Intermediate CA cert
   ca/intermediate.key.pem  # Intermediate CA key (protect this)
-  ca/ca.crt.srl, ca/intermediate.crt.srl  # Serial numbers
+  ca/ca.srl, ca/intermediate.srl  # Serial number files
   issued/server.crt.pem  # Server leaf cert
   csr/server.csr.pem     # Certificate signing request
 ```
@@ -406,7 +432,7 @@ The `--verify-tls` flag handles end-to-end verification automatically. The
 commands below are useful for debugging if something goes wrong.  
 
 If you have already applied the certs to a Qumulo cluster via `qq` then you can use
-it as a verfication target from your non-Qumulo clients that received the self-trusted
+it as a verification target from your non-Qumulo clients that received the self-trusted
 CA certs via CA_Pusher.sh using port 443 or 9000
 
 Verify the certificate chain and name locally:

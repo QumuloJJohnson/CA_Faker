@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# configure_clusterA_qumulo_tls_ubuntu.sh
+# configure_clusterA_qumulo_tls.sh
 #
-# Script to prepare TLS materials for Qumulo Cluster A
+# Prepares TLS materials for Qumulo Cluster A (needs bash 4+; runs on Ubuntu
+# and Rocky 9.3 / OpenSSL 3.0.7, WSL, or macOS with Homebrew bash and OpenSSL 3)
 # up to (but NOT including) running `qq ssl_modify_certificate`.
-# Runs on Linux, WSL, or macOS with Homebrew bash 4+ and OpenSSL 3.
 #
 # REQUIRED: --cn <fqdn>
 #
@@ -15,6 +15,8 @@
 #   ca/intermediate.crt.pem, ca/intermediate.key.pem
 #                          (intermediate CA that signs the server cert - protect the key!)
 #   ca/ca.cer              (DER copy of the root CA cert, for double-click import)
+#   ca/ca.srl, ca/intermediate.srl
+#                          (serial number files)
 # With --ca-dir, the CA (keys included) lives in that directory instead and
 # only the public ca.crt.pem / intermediate.crt.pem / ca.cer are copied to ca/.
 #
@@ -99,6 +101,8 @@ Outputs (in --out-dir):
   ca/ca.key.pem
   ca/intermediate.crt.pem
   ca/intermediate.key.pem
+  ca/ca.srl
+  ca/intermediate.srl
   ca/ca.cer
   issued/server.crt.pem
   csr/server.csr.pem
@@ -532,15 +536,13 @@ Files for Qumulo:
   $certbundle
 
 Next steps:
-  1. Linux nodes and clients - trust the root CA:
-       ./CA_Pusher.sh --clients <file> --ca $OUT_DIR
-     (add --container qcore for Qumulo nodes so their own processes trust the lab)
-  2. Qumulo - apply the certificate (use your cluster's name, e.g. $suggest):
+  1. Qumulo - apply the certificate, README step 3 (use your cluster's name, e.g. $suggest):
        qq --host <your-cluster> login -u admin
        qq --host <your-cluster> ssl_modify_certificate -c $certbundle -k $server_key
-  3. Confirm end to end after applying:
+  2. Linux nodes and clients - trust the root CA and confirm end to end
+     (README step 4; add --container qcore for Qumulo nodes):
        ./CA_Pusher.sh --clients <file> --ca $OUT_DIR --verify-tls <cluster-fqdn>:443
-  4. Desktops/browsers: see README step 5 — you will need the root CN and
+  3. Desktops/browsers: see README step 5 — you will need the root CN and
      SHA-1 above.
 
 WARNING: this root can sign certs for ANY site — keep $secret secret and remove the root when the lab ends.
@@ -676,7 +678,7 @@ main() {
       -in "$tmp_dir/intermediate.csr.pem" \
       -CA "$ca_crt" \
       -CAkey "$ca_key" \
-      -CAserial "$ca_dir/ca.crt.srl" \
+      -CAserial "$ca_dir/ca.srl" \
       -CAcreateserial \
       -sha256 -days "$CA_DAYS" \
       -extfile "$tmp_dir/intermediate_ext.cnf" \
@@ -730,7 +732,7 @@ main() {
       -in "$server_csr" \
       -CA "$int_crt" \
       -CAkey "$int_key" \
-      -CAserial "$ca_dir/intermediate.crt.srl" \
+      -CAserial "$ca_dir/intermediate.srl" \
       -CAcreateserial \
       -out "$server_crt" \
       -days "$SERVER_DAYS" \

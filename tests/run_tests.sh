@@ -280,6 +280,17 @@ test_faker_builds_root_intermediate_leaf_chain() {
   assert_rc 0
 }
 
+# Serial files have explicit names next to their CA (upstream: ca/ca.srl);
+# OpenSSL/LibreSSL versions otherwise derive different defaults.
+test_faker_serial_files_have_explicit_names() {
+  faker_outdir od || return 1
+  assert_file od/ca/ca.srl
+  assert_file od/ca/intermediate.srl
+  assert_no_file od/ca/ca.crt.srl
+  assert_no_file od/ca/intermediate.crt.srl
+  assert_no_file od/.srl
+}
+
 test_faker_rerun_reuses_everything() {
   faker_outdir od || return 1
   local before after
@@ -852,6 +863,17 @@ test_readme_documents_every_flag() {
     done
     [[ "$n" -ge 2 ]] || fail "no flags found in $script --help"
   done
+}
+
+# CA_Pusher's "cert not applied yet" hint must name the README step that
+# applies TLS to Qumulo, whatever its number.
+test_pusher_hint_names_readme_apply_step() {
+  local n
+  n="$(sed -n 's/^### \([0-9]\)\. Apply TLS to Qumulo$/\1/p' "$REPO/README.md")"
+  [[ -n "$n" ]] || { fail "README has no 'Apply TLS to Qumulo' step"; return 0; }
+  local hits
+  hits="$(grep -o 'README step [0-9]' "$PUSHER" | sort -u)"
+  assert_eq "$hits" "README step $n" "README step named by CA_Pusher hints"
 }
 
 test_ready_points_desktops_to_readme_step_5() {

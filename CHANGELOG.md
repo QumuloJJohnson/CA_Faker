@@ -17,8 +17,13 @@
   count are read from the cert in the `READY.` block. CA_Pusher adds
   `RESULT ...` lines to stdout (see README); other output is unchanged.
 - Upgrading a running lab: re-apply the new cert to the cluster (README step
-  4) BEFORE re-pushing trust (step 3), or nodes reject the old served cert in
+  3) BEFORE re-pushing trust (step 4), or nodes reject the old served cert in
   between.
+- Includes the upstream Rocky 9.3 changes: README order "apply TLS (step 3),
+  then push the CA (step 4)", `ca/ca.srl` as the root's serial file (plus
+  `ca/intermediate.srl`), `restorecon` on SELinux hosts, trust-store detection
+  that also checks the anchor directory exists, `sudo -S -p ''` (no prompt
+  text), and the sshpass install hints for Rocky/RHEL.
 
 ## 2.0.0 (unreleased)
 
@@ -86,7 +91,7 @@
 - The chain is now root CA -> intermediate CA -> server cert, and
   `certbundle.pem` holds all three (leaf, intermediate, root). New files:
   `ca/intermediate.crt.pem`, `ca/intermediate.key.pem` and the serial files
-  `ca/ca.crt.srl`, `ca/intermediate.crt.srl`.
+  `ca/ca.srl`, `ca/intermediate.srl`.
 - The root and intermediate carry `keyUsage = critical, keyCertSign, cRLSign`
   (strict clients such as Python 3.13+ rejected the old root). Every cert
   carries explicit Subject/Authority Key Identifiers, so OpenSSL 1.1.1 and

@@ -23,7 +23,8 @@
 # Requirements (on Cluster A):
 #   - bash, ssh, scp, openssl
 #   - OPTIONAL: sshpass (only if using password-based SSH)
-#       sudo apt-get update && sudo apt-get install -y sshpass
+#       Ubuntu/Debian:  sudo apt-get update && sudo apt-get install -y sshpass
+#       Rocky/RHEL:     sudo dnf install -y epel-release && sudo dnf install -y sshpass
 #
 # Usage:
 #   ./CA_Pusher.sh \
@@ -474,7 +475,7 @@ run_remote_sudo_script() {
   #   2. decode the base64 payload into a temp script
   #   3. run the temp script under sudo -S (password piped in)
   #   4. clean up and propagate the exit code
-  local sudo_cmd="sudo -S"
+  local sudo_cmd="sudo -S -p ''"
   if [[ -z "$SUDO_PASS" ]]; then
     if ! run_ssh_no_tty "$host" "sudo -n true" </dev/null; then
       err "[$host] no sudo password was given and ${SSH_USER} cannot sudo without one"
@@ -532,12 +533,14 @@ fp_of() {
 # update-ca-certificates is checked first so Ubuntu hosts behave as before.
 trust_family() {
   local label="$1"
-  if command -v update-ca-certificates >/dev/null 2>&1; then
+  # The tool alone is not enough: a host can carry the binary without the
+  # anchor directory of that family.
+  if command -v update-ca-certificates >/dev/null 2>&1 && [ -d /usr/local/share/ca-certificates ]; then
     echo "$label: Ubuntu-family (update-ca-certificates)"
     TS_DIR="/usr/local/share/ca-certificates"
     TS_REFRESH="update-ca-certificates"
     TS_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
-  elif command -v update-ca-trust >/dev/null 2>&1; then
+  elif command -v update-ca-trust >/dev/null 2>&1 && [ -d /etc/pki/ca-trust/source/anchors ]; then
     echo "$label: RHEL-family (update-ca-trust)"
     TS_DIR="/etc/pki/ca-trust/source/anchors"
     TS_REFRESH="update-ca-trust extract"
@@ -580,6 +583,8 @@ trust_install() {
   cat "$tmp" > "$dst" || { rm -f "$tmp"; return 1; }
   rm -f "$tmp"
   chmod 0644 "$dst" || return 1
+  # SELinux hosts (RHEL family) need the anchors context on the new file.
+  if command -v restorecon >/dev/null 2>&1; then restorecon "$dst" || true; fi
   $TS_REFRESH >/dev/null || { echo "ERROR: $TS_REFRESH failed on $where" >&2; return 1; }
   echo "Installed: $dst"
   openssl x509 -in "$dst" -noout -subject -fingerprint -sha256 || return 1
@@ -765,7 +770,7 @@ for EP in $VERIFY_TLS_EPS; do
     echo "TLS OK (container $CONTAINER): chain and name validated for $EP"
     echo "RESULT $HOST tls container $CONTAINER $EP OK"
   else
-    echo "ERROR: trust store installed OK, but TLS endpoint $EP did not validate in container $CONTAINER (expected if the cert has not been applied to the cluster yet — README step 4)" >&2
+    echo "ERROR: trust store installed OK, but TLS endpoint $EP did not validate in container $CONTAINER (expected if the cert has not been applied to the cluster yet — README step 3)" >&2
     echo "RESULT $HOST tls container $CONTAINER $EP FAILED"
     ANY_FAIL=1
   fi
@@ -778,7 +783,7 @@ for EP in $VERIFY_TLS_EPS; do
     echo "TLS OK (host): chain and name validated for $EP"
     echo "RESULT $HOST tls host $EP OK"
   else
-    echo "ERROR: trust store installed OK, but TLS endpoint $EP did not validate (expected if the cert has not been applied to the cluster yet — README step 4)" >&2
+    echo "ERROR: trust store installed OK, but TLS endpoint $EP did not validate (expected if the cert has not been applied to the cluster yet — README step 3)" >&2
     echo "RESULT $HOST tls host $EP FAILED"
     ANY_FAIL=1
   fi
