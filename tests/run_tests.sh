@@ -1159,6 +1159,15 @@ test_lab_inventory_records_every_root_and_keeps_installed() {
   [[ "$(sed -n 1p lab/inventory.txt | cut -f7)" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || fail "date field"
 }
 
+# A host that ever got the lab key keeps key-mode "lab", even if a later run
+# used --ssh-key, so --remove still removes the lab key there.
+test_lab_inventory_keeps_lab_key_mode() {
+  mkdir -p lab
+  run_inv_update node1 labu client "-" lab "AAAA"
+  run_inv_update node1 labu client "-" "own:/k" "AAAA"
+  assert_eq "$(cut -f5 lab/inventory.txt)" "lab" "key-mode after a later --ssh-key run"
+}
+
 test_lab_refuses_an_older_sibling_script() {
   cp "$FAKER" "$PUSHER" "$LAB" .
   sed -i.bak 's/^VERSION="2.0.0"$/VERSION="1.9.0"/' ./CA_Pusher.sh

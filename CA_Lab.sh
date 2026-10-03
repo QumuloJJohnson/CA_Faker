@@ -571,6 +571,8 @@ inv_update() {
         if [[ "$c" == *":installed" && "$cont" == "${c%%:*}:"* ]]; then
           cont="$c"
         fi
+        # Once the lab key was pushed, --remove must still remove it.
+        [[ "$k" == "lab" ]] && keymode="lab"
         if [[ -n "$root" && "$roots" == "-" ]]; then
           roots="$root"
         elif [[ -n "$root" && ",$roots," != *",$root,"* ]]; then
